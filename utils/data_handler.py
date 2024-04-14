@@ -1,8 +1,18 @@
 import threading
+from datetime import datetime
 
-import numpy as np
 import rosbag
 from pytictac import ClassTimer, accumulate_time
+from rospy import Time
+from tqdm import tqdm
+
+from utils.sliding_window_queue import SlidingWindowQueue
+
+
+def _to_timestamp(img_stream_t):
+    seconds = img_stream_t.to_sec()
+    date = datetime.fromtimestamp(seconds)
+    return date
 
 
 def _print_lock(func):
@@ -128,14 +138,20 @@ class DataHandler:
         self.npc_bag = bag
 
     @accumulate_time
-    def get_next_msg(self, topic_name: str, start_time: float):
+    def report_frequencies(self):
+
+        print("\nFrequency report:")
+        for topic, bag in self.topics_register.items():
+            print(f"» {topic}: {bag.get_message_count() / (bag.get_end_time() - bag.get_start_time())}")
+
+    @accumulate_time
+    def get_msg_stream(self, topic_name: str, start_time: Time = None):
 
         if topic_name not in self.topics_register:
             raise ValueError(f"Topic {topic_name} not found in the registered topics")
 
         bag = self.topics_register[topic_name]
-
-        return next(bag.read_messages(topics=[topic_name], start_time=start_time))
+        return bag.read_messages(topics=[topic_name]), bag.get_start_time(), bag.get_end_time()
 
     @accumulate_time
     def get_start_time(self):
@@ -150,3 +166,81 @@ class DataHandler:
         print(f"\nTiming report for {self.__class__.__name__}")
         print(self.cct.__str__())
         print()
+
+    @accumulate_time
+    def get_synchronized_dataset(self, limit: int = None):
+
+        training_data = []
+
+        # get msg streams
+        img_stream, img_stream_start_t, img_stream_end_t = self.get_msg_stream(
+            '/wide_angle_camera_front/image_color/compressed')
+        state_stream, state_stream_start_t, state_stream_end_t = self.get_msg_stream(
+            '/state_estimator/anymal_state')
+        command_stream, command_stream_start_t, command_stream_end_t = self.get_msg_stream(
+            '/motion_reference/command_twist')
+
+        counter = 0
+
+        img_stream_topic, img_stream_msg, img_stream_t = next(img_stream)
+        state_topic, state_msg, state_t = next(state_stream)
+
+        img_queue = SlidingWindowQueue(maxsize=2)
+        state_queue = SlidingWindowQueue(maxsize=5)
+        event_queue = SlidingWindowQueue(maxsize=20)
+
+        training_data_tmp = None
+        for (command_topic, command_msg, command_t) in tqdm(command_stream):
+            counter += 1
+
+            if limit is not None and counter > limit:
+                break
+
+            try:
+
+                while _to_timestamp(img_stream_t) < _to_timestamp(command_t):
+                    img_stream_topic, img_stream_msg, img_stream_t = next(img_stream)
+                    img_queue.put((img_stream_msg, img_stream_t))
+
+                while _to_timestamp(state_t) < _to_timestamp(command_t):
+                    state_topic, state_msg, state_t = next(state_stream)
+                    state_queue.put((state_msg, state_t))
+
+                    # check if the event queue only olds future states
+                    if training_data_tmp is not None:
+                        assert training_data_tmp['time'] < _to_timestamp(state_t), \
+                            f"Expected {training_data_tmp['time']} < {state_t}"
+
+                    event_queue.put((state_msg, state_t))
+
+            except StopIteration:
+                print("  stopping synchronization")
+                break
+
+            # save training data from previous iteration
+            if training_data_tmp is not None:
+
+                training_data.append((
+                    training_data_tmp,
+                    event_queue.dump_as_array()
+                ))
+
+            else:
+                print("  skipping iteration")
+                event_queue.empty()
+
+            # create training data for current iteration
+            # while skipping invalid data
+            try:
+                training_data_tmp = {
+                    'imgs': img_queue.dump_as_array(),
+                    'states': state_queue.dump_as_array(),
+                    "time": _to_timestamp(command_t),
+                    'commands': command_msg,
+                }
+
+            except AssertionError:
+                training_data_tmp = None
+
+        print(f"Synchro done for {counter} frames")
+        return training_data
