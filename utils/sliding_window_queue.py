@@ -16,4 +16,15 @@ class SlidingWindowQueue(Queue):
             arr.append(self.get())
 
         assert len(arr) == self.maxsize and self.empty(), f"Expected {self.maxsize} items, got {len(arr)}"
+
+        arr = np.array(arr)
+        np.flip(arr, axis=0)
+        return arr
+
+    def copy_to_array(self):
+        arr = []
+        for i in range(len(self.queue)):
+            arr.append(self.queue[i])
+
+        assert len(arr) == self.maxsize, f"Expected {self.maxsize} items, got {len(arr)}"
         return np.array(arr)

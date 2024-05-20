@@ -1,5 +1,4 @@
 import threading
-from datetime import datetime
 
 import rosbag
 from pytictac import ClassTimer, accumulate_time
@@ -7,12 +6,6 @@ from rospy import Time
 from tqdm import tqdm
 
 from utils.sliding_window_queue import SlidingWindowQueue
-
-
-def _to_timestamp(img_stream_t):
-    seconds = img_stream_t.to_sec()
-    date = datetime.fromtimestamp(seconds)
-    return date
 
 
 def _print_lock(func):
@@ -50,6 +43,8 @@ class DataHandler:
 
         # lock for printing
         self.print_lock = threading.Lock()
+
+        self.training_data_arr = []
 
     @accumulate_time
     def load_data(self):
@@ -170,89 +165,112 @@ class DataHandler:
     @accumulate_time
     def get_synchronized_dataset(self, limit: int = None):
 
-        training_data = []
+        self.training_data_arr = []
 
         # get msg streams
-        img_stream, img_stream_start_t, img_stream_end_t = self.get_msg_stream(
+        img_stream, img_stream_start_t, _ = self.get_msg_stream(
             '/wide_angle_camera_front/image_color/compressed')
-        state_stream, state_stream_start_t, state_stream_end_t = self.get_msg_stream(
+        state_stream, state_stream_start_t, _ = self.get_msg_stream(
             '/state_estimator/anymal_state')
-        command_stream, command_stream_start_t, command_stream_end_t = self.get_msg_stream(
+        command_stream, command_stream_start_t, _ = self.get_msg_stream(
             '/motion_reference/command_twist')
 
-        counter = 0
-
-        img_stream_topic, img_stream_msg, img_stream_t = next(img_stream)
-        state_topic, state_msg, state_t = next(state_stream)
+        _, img_msg, _ = next(img_stream)
+        _, state_msg, _ = next(state_stream)
 
         img_queue = SlidingWindowQueue(maxsize=2)
-        state_queue = SlidingWindowQueue(maxsize=5)
+        pre_state_queue = SlidingWindowQueue(maxsize=5)
+        post_state_queue = SlidingWindowQueue(maxsize=300)
+        training_queue = SlidingWindowQueue(maxsize=10)
 
-        # describes the number of events to be considered in the future
-        event_queue = SlidingWindowQueue(maxsize=300)
-
-        training_data_tmp = None
-        for (command_topic, command_msg, command_t) in tqdm(command_stream):
+        counter = 0
+        fst_cmd_t = None
+        for (_, command_msg, _) in tqdm(command_stream):
             counter += 1
+
+            if fst_cmd_t is None:
+                fst_cmd_t = command_msg.header.stamp
 
             if limit is not None and counter > limit:
                 break
 
             try:
+                while img_msg.header.stamp <= command_msg.header.stamp:
+                    img_queue.put(img_msg)
+                    _, img_msg, _ = next(img_stream)
 
-                while _to_timestamp(img_stream_t) < _to_timestamp(command_t):
-                    img_stream_topic, img_stream_msg, img_stream_t = next(img_stream)
-                    img_queue.put((img_stream_msg, img_stream_t))
+                while state_msg.header.stamp <= command_msg.header.stamp:
+                    pre_state_queue.put(state_msg)
+                    _, state_msg, _ = next(state_stream)
 
-                while _to_timestamp(state_t) < _to_timestamp(command_t):
-                    state_topic, state_msg, state_t = next(state_stream)
-                    state_queue.put((state_msg, state_t))
+                    # ignore states before the first command
+                    if state_msg.header.stamp >= fst_cmd_t:
+                        post_state_queue.put(state_msg)
 
-                    # check if the event queue only olds future states
-                    if training_data_tmp is not None:
-                        assert training_data_tmp['time'] < _to_timestamp(state_t), \
-                            f"Expected {training_data_tmp['time']} < {state_t}"
-
-                    event_queue.put((state_msg, state_t))
+                    if (not training_queue.empty() and post_state_queue.full() and
+                            post_state_queue.queue[0].header.stamp >= training_queue.queue[0]['command'].header.stamp):
+                        self.save_to_training_set(fst_cmd_t, post_state_queue, training_queue)
 
             except StopIteration:
                 print("  stopping synchronization")
                 break
 
-            # save training data from previous iteration
-            if training_data_tmp is not None:
+            if img_queue.full() and pre_state_queue.full():
 
-                # check if the event queue is full
-                if not event_queue.full():
-                    print("  skip iteration: warmup event queue")
-                    continue
+                cmd_t = command_msg.header.stamp
+                imgs = img_queue.dump_as_array()
+                states = pre_state_queue.dump_as_array()
 
-                events = event_queue.dump_as_array()
-                training_data.append((
-                    training_data_tmp,
-                    events
-                ))
+                # check order of states
+                for i in range(1, len(states)):
+                    assert states[i].header.stamp >= states[i - 1].header.stamp, \
+                        f"Expected {states[i].header.stamp} >= {states[i - 1].header.stamp}"
 
-                # put back the events to the queue, as we are going to use them in the next iteration
-                for event in events:
-                    event_queue.put(event.copy())
+                # check order of images
+                for i in range(1, len(imgs)):
+                    assert imgs[i].header.stamp >= imgs[i - 1].header.stamp, \
+                        f"Expected {imgs[i].header.stamp} >= {imgs[i - 1].header.stamp}"
 
-            else:
-                print("  skipping iteration")
-                event_queue.empty()
+                # all states and images should be before the command
+                assert states[-1].header.stamp <= cmd_t, f"Expected {states[-1].header.stamp} <= {cmd_t}"
+                assert imgs[-1].header.stamp <= cmd_t, f"Expected {imgs[-1].header.stamp} <= {cmd_t}"
+                assert cmd_t >= fst_cmd_t, f"Expected {cmd_t} >= {fst_cmd_t}"
 
-            # create training data for current iteration
-            # while skipping invalid data
-            try:
-                training_data_tmp = {
-                    'imgs': img_queue.dump_as_array(),
-                    'states': state_queue.dump_as_array(),
-                    "time": _to_timestamp(command_t),
-                    'commands': command_msg,
-                }
+                training_queue.put({
+                    'imgs': imgs,
+                    'states': states,
+                    'command': command_msg,
+                })
 
-            except AssertionError:
-                training_data_tmp = None
+        print(f"Synchro done for {counter} frames, extracted {len(self.training_data_arr)} training data")
+        return self.training_data_arr
 
-        print(f"Synchro done for {counter} frames")
-        return training_data
+    def save_to_training_set(self, fst_cmd_t, post_state_queue, training_queue):
+
+        training_data = training_queue.get()
+        cmd_t = training_data['command'].header.stamp
+
+        assert post_state_queue.full(), "Expected post_state_queue to be full"
+
+        events = post_state_queue.copy_to_array()
+        post_queue_start_t = events[0].header.stamp
+
+        assert post_queue_start_t >= fst_cmd_t, f"Expected {post_queue_start_t} <= {fst_cmd_t}"
+        assert post_queue_start_t >= cmd_t, f"Expected {post_queue_start_t} >= {cmd_t}"
+
+        assert len(events) == post_state_queue.maxsize, \
+            f"Expected {post_state_queue.maxsize} events, got {len(events)}"
+
+        # check order of events
+        for i in range(1, len(events)):
+            assert events[i].header.stamp >= events[i - 1].header.stamp, \
+                f"Expected {events[i].header.stamp} >= {events[i - 1].header.stamp}"
+
+        # validate time constraints
+        assert cmd_t >= fst_cmd_t, \
+            f"Expected {cmd_t} <= {fst_cmd_t}"
+
+        self.training_data_arr.append((
+            training_data,
+            events
+        ))
