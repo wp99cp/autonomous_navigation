@@ -23,15 +23,18 @@ class DataHandler:
             self,
             jetson_bag_file: str = None,
             lpc_bag_file: str = None,
-            npc_bag_file: str = None
+            npc_bag_file: str = None,
+            print_details: bool = False
     ):
         self.jetson_bag_file = jetson_bag_file
         self.lpc_bag_file = lpc_bag_file
         self.npc_bag_file = npc_bag_file
+        self.print_details = print_details
 
-        print(f"Jetson bag file: {self.jetson_bag_file}")
-        print(f"lpc bag file: {self.lpc_bag_file}")
-        print(f"npc bag file: {self.npc_bag_file}")
+        if self.print_details:
+            print(f"Jetson bag file: {self.jetson_bag_file}")
+            print(f"lpc bag file: {self.lpc_bag_file}")
+            print(f"npc bag file: {self.npc_bag_file}")
 
         self.cct = ClassTimer(objects=[self], names=["DataHandler"])
 
@@ -48,7 +51,9 @@ class DataHandler:
 
     @accumulate_time
     def load_data(self):
-        print(f'Loading data from {self.jetson_bag_file}')
+
+        if self.print_details:
+            print("Loading data from bags")
 
         # we open the bags in parallel
         threads = [
@@ -60,6 +65,9 @@ class DataHandler:
             t.start()
         for t in threads:
             t.join()
+
+        if self.print_details:
+            self.report_frequencies()
 
     @accumulate_time
     @_print_lock
@@ -96,10 +104,14 @@ class DataHandler:
         if self.jetson_bag_file is None:
             return
 
-        print(f'Opening jetson bag file {self.jetson_bag_file}')
+        if self.print_details:
+            print(f'Opening jetson bag file {self.jetson_bag_file}')
 
         bag = rosbag.Bag(self.jetson_bag_file)
-        self._print_bag_meta_data(bag, "Jetson")
+
+        if self.print_details:
+            self._print_bag_meta_data(bag, "Jetson")
+
         self._register_topics([topic for topic in bag.get_type_and_topic_info().topics], bag)
 
         self.jetson_bag = bag
@@ -110,10 +122,14 @@ class DataHandler:
         if self.lpc_bag_file is None:
             return
 
-        print(f'Opening lpc bag file {self.lpc_bag_file}')
+        if self.print_details:
+            print(f'Opening lpc bag file {self.lpc_bag_file}')
 
         bag = rosbag.Bag(self.lpc_bag_file)
-        self._print_bag_meta_data(bag, "lpc")
+
+        if self.print_details:
+            self._print_bag_meta_data(bag, "lpc")
+
         self._register_topics([topic for topic in bag.get_type_and_topic_info().topics], bag)
 
         self.lpc_bag = bag
@@ -124,10 +140,14 @@ class DataHandler:
         if self.npc_bag_file is None:
             return
 
-        print(f'Opening npc bag file {self.npc_bag_file}')
+        if self.print_details:
+            print(f'Opening npc bag file {self.npc_bag_file}')
 
         bag = rosbag.Bag(self.npc_bag_file)
-        self._print_bag_meta_data(bag, "npc")
+
+        if self.print_details:
+            self._print_bag_meta_data(bag, "npc")
+
         self._register_topics([topic for topic in bag.get_type_and_topic_info().topics], bag)
 
         self.npc_bag = bag
@@ -185,11 +205,13 @@ class DataHandler:
 
         counter = 0
         fst_cmd_t = None
+        last_cmd_t = None
         for (_, command_msg, _) in tqdm(command_stream):
             counter += 1
 
             if fst_cmd_t is None:
                 fst_cmd_t = command_msg.header.stamp
+            last_cmd_t = command_msg.header.stamp
 
             if limit is not None and counter > limit:
                 break
@@ -242,7 +264,12 @@ class DataHandler:
                     'command': command_msg,
                 })
 
+        print("\n========================")
         print(f"Synchro done for {counter} frames, extracted {len(self.training_data_arr)} training data")
+        print(f"Time between first command and last command:")
+        print(f" - {(last_cmd_t - fst_cmd_t).to_sec()} seconds")
+        print(f" - {(last_cmd_t - fst_cmd_t).to_sec() / 60} minutes")
+        print("========================\n")
         return self.training_data_arr
 
     def save_to_training_set(self, fst_cmd_t, post_state_queue, training_queue):
