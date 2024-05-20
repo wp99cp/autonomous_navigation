@@ -19,94 +19,134 @@ def _feature_extraction(xs):
     # feature extraction
     numerical_features = []
 
-    for state, t in xs['states']:
+    for state in xs['states']:
         numerical_features.append(state.twist.twist.linear.x)
         numerical_features.append(state.twist.twist.linear.y)
         numerical_features.append(state.twist.twist.linear.z)
 
     # get images and convert them to RGB
     imgs = []
-    for img, t in xs['imgs']:
+    times = []
+    for img in xs['imgs']:
         imgs.append(get_rgb_image(img))
+        times.append(img.header.stamp)
 
-    return np.array(numerical_features), np.array(imgs)
+    return np.array(numerical_features), np.array(imgs), times
 
 
-def _label_extraction(ys):
-    # label extraction
-
-    print(f"len of ys: {len(ys)}")
-
+def _label_extraction(ys, xs):
     # plot the contact forces /state_estimator/contact_force_lf_foot
-    contact_force_LF_z = [y[0].contacts[0].wrench.force.z for y in ys]
-    contact_force_RF_z = [y[0].contacts[1].wrench.force.z for y in ys]
-    contact_force_LH_z = [y[0].contacts[2].wrench.force.z for y in ys]
-    contact_force_RH_z = [y[0].contacts[3].wrench.force.z for y in ys]
+    contact_force_LF_z = [y.contacts[0].wrench.force.z for y in ys]
+    contact_force_RF_z = [y.contacts[1].wrench.force.z for y in ys]
+    contact_force_LH_z = [y.contacts[2].wrench.force.z for y in ys]
+    contact_force_RH_z = [y.contacts[3].wrench.force.z for y in ys]
+
+    position_LF_z = [y.contacts[0].position.z for y in ys]
+    position_RF_z = [y.contacts[1].position.z for y in ys]
+    position_LH_z = [y.contacts[2].position.z for y in ys]
+    position_RH_z = [y.contacts[3].position.z for y in ys]
+
+    twist_x = [y.twist.twist.linear.x for y in ys]
+    twist_y = [y.twist.twist.linear.y for y in ys]
+    twist_z = [y.twist.twist.linear.z for y in ys]
 
     # map index to time stamps
-    idxs = [y[0].header.stamp.to_sec() for y in ys]
+    idxs = [y.header.stamp.to_sec() for y in ys]
+
+    # set title
+    time_stamp = ys[0].header.stamp.to_sec()
+
+    # convert time to humain readable format
+    import datetime
+    time_stamp = datetime.datetime.fromtimestamp(time_stamp).strftime('%Y-%m-%d %H:%M:%S %f')
 
     # plot forces using matplotlib
     import matplotlib.pyplot as plt
 
-    plt.plot(idxs, contact_force_LF_z, label='LF')
-    plt.plot(idxs, contact_force_RF_z, label='RF')
-    plt.plot(idxs, contact_force_LH_z, label='LH')
-    plt.plot(idxs, contact_force_RH_z, label='RH')
+    fig, ax = plt.subplots(2, 2, figsize=(15, 10))
+    plt1 = ax[0][0]
+    plt2 = ax[0][1]
+    plt3 = ax[1][0]
+    plt4 = ax[1][1]
 
-    # set title
-    time_stamp = ys[150][0].header.stamp.to_sec()
+    # plot vertical lines at command timestamps
+    command = xs['command']
+    cmd_timestamps = [x.to_sec() for x in xs['commands_timestamp']]
+    cmd_timestamps = np.array(cmd_timestamps)
+    for p in [plt1, plt2, plt4]:
+        for i, cmd_timestamp in enumerate(cmd_timestamps):
+            if i == 0:
+                p.axvline(x=cmd_timestamp, color='b', linestyle='-.', label='upcoming commands', alpha=0.1)
+            else:
+                p.axvline(x=cmd_timestamp, color='b', linestyle='-.', alpha=0.1)
 
-    # convert time to humain readable format
-    import datetime
-    time_stamp = datetime.datetime.fromtimestamp(time_stamp).strftime('%Y-%m-%d %H:%M:%S')
-    plt.title(f'Contact forces [Time {time_stamp}]')
+        # plot horizontal line at command.twist.linear.x
+        p.axvline(x=command.header.stamp.to_sec(), color='b', linestyle='--', alpha=0.5)
 
-    # set y min max -100, 500
-    plt.ylim(-100, 500)
+    plt1.plot(idxs, contact_force_LF_z, label='LF')
+    plt1.plot(idxs, contact_force_RF_z, label='RF')
+    plt1.plot(idxs, contact_force_LH_z, label='LH')
+    plt1.plot(idxs, contact_force_RH_z, label='RH')
+    plt1.set_title(f'Contact forces (z) [starting at {time_stamp}]')
+    plt1.set_ylim([-100, 500])
 
-    # force legend to be shown in top right corner
-    plt.legend(loc='upper right')
+    plt1.legend(loc='upper right')
+    plt1.set_xlabel('Time [s]')
+    plt1.set_ylabel('Force [N]')
 
-    # plot lable for x and y axis
-    plt.xlabel('Time [s]')
-    plt.ylabel('Force [N]')
+    plt2.plot(idxs, position_LF_z, label='LF')
+    plt2.plot(idxs, position_RF_z, label='RF')
+    plt2.plot(idxs, position_LH_z, label='LH')
+    plt2.plot(idxs, position_RH_z, label='RH')
+    plt2.set_title(f'Contact positions (z) [starting at {time_stamp}]')
+    plt2.set_xlabel('Time [s]')
+    plt2.set_ylabel('Position [m]')
+    plt2.legend(loc='upper right')
+
+    img = xs['imgs'][0]
+    t = img.header.stamp
+    img = get_rgb_image(img)
+
+    plt3.imshow(img)
+    time_stamp = datetime.datetime.fromtimestamp(t.to_sec()).strftime('%Y-%m-%d %H:%M:%S %f')
+    plt3.set_title(f'RGB Image [Captured at {time_stamp}]')
+
+    # add description
+    plt3.text(7, 190, f'cmd.linear.x={command.twist.linear.x:.2f} m/s', color='white', fontsize=10, fontweight='bold')
+    plt3.text(7, 200, f'cmd.angular.z={command.twist.angular.z:.2f} rad/s', color='white', fontsize=10, fontweight='bold')
+
+    # plot horizontal line at command.twist.linear.x
+    plt4.axhline(y=command.twist.linear.x, color='b', linestyle='--', label='cmd.linear.x', alpha=0.5)
+
+    plt4.plot(idxs, twist_x, label='x')
+    plt4.plot(idxs, twist_y, label='y')
+    plt4.plot(idxs, twist_z, label='z')
+    plt4.set_title(f'twist.linear [starting at {time_stamp}]')
+    plt4.set_xlabel('Time [s]')
+    plt4.set_ylabel('Twist [m/s]')
+
+    plt4.legend(loc='upper left')
+    plt4.set_ylim([-0.6, 1.6])
+
+    plt.tight_layout()
 
     # save plot in folder /tmp
-    plt.savefig(f'/tmp/contact_forces_{ys[150][0].header.stamp.to_sec()}.png')
-    plt.close()
+    time_stamp = ys[150].header.stamp
+    time_stamp_nano = time_stamp.to_nsec()
 
-    pos_x = np.array([y[0].pose.pose.position.x for y in ys])
-    pos_y = np.array([y[0].pose.pose.position.y for y in ys])
-    pos_z = np.array([y[0].pose.pose.position.z for y in ys])
+    # fill up the string with zeros
+    time_stamp_str = str(time_stamp_nano) + '0' * (19 - len(str(time_stamp_nano)))
+    fig.savefig(f'/tmp/contact_forces_{time_stamp_str}.png')
 
-    twist_x = np.array([y[0].twist.twist.linear.x for y in ys])
-    twist_y = np.array([y[0].twist.twist.linear.y for y in ys])
-    twist_z = np.array([y[0].twist.twist.linear.z for y in ys])
+    # close the plot
+    plt.close(fig)
 
-    # normalize the data
-    pos_x = (pos_x - np.mean(pos_x)) / np.std(pos_x)
-    pos_y = (pos_y - np.mean(pos_y)) / np.std(pos_y)
-    pos_z = (pos_z - np.mean(pos_z)) / np.std(pos_z)
-
-    twist_x = (twist_x - np.mean(twist_x)) / np.std(twist_x)
-    twist_y = (twist_y - np.mean(twist_y)) / np.std(twist_y)
-    twist_z = (twist_z - np.mean(twist_z)) / np.std(twist_z)
-
-    xp_inter, xp_slope = np.polyfit(pos_x, twist_x, 1)
-    yp_inter, yp_slope = np.polyfit(pos_y, twist_y, 1)
-    zp_inter, zp_slope = np.polyfit(pos_z, twist_z, 1)
-
-    xt_inter, xt_slope = np.polyfit(twist_x, pos_x, 1)
-    yt_inter, yt_slope = np.polyfit(twist_y, pos_y, 1)
-    zt_inter, zt_slope = np.polyfit(twist_z, pos_z, 1)
-
-    return [int(xp_inter >= 0), int(xp_slope >= 0)]
+    return [0, 1, 2, 3]
 
 
 def _prepare_data(item):
-    X, y = item
-    return (_feature_extraction(X), _label_extraction(y))
+    xs, y = item
+    return _feature_extraction(xs), _label_extraction(y, xs)
 
 
 def train_model(data_set):
@@ -265,8 +305,7 @@ def extract_data_from_bags():
 
     # prepare data
     # Use the maximum number of available CPU cores for parallel processing
-    # TODO: set back to 32 threads
-    num_cores = min(multiprocessing.cpu_count() * 2, 1)
+    num_cores = min(multiprocessing.cpu_count() * 2, 32)
     print("\nPreparing data with multiprocessing n_cors =", num_cores)
     with multiprocessing.Pool(num_cores) as p:
         training_data = list(

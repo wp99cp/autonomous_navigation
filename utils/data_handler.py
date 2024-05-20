@@ -250,10 +250,14 @@ class DataHandler:
         training_data = training_queue.get()
         cmd_t = training_data['command'].header.stamp
 
-        assert post_state_queue.full(), "Expected post_state_queue to be full"
-
         events = post_state_queue.copy_to_array()
         post_queue_start_t = events[0].header.stamp
+        post_queue_end_t = events[-1].header.stamp
+
+        upcoming_command_timestamps = [cmd['command'].header.stamp for cmd in training_queue.queue if
+                                       cmd['command'].header.stamp <= post_queue_end_t]
+        training_data['commands_timestamp'] = [cmd_t] + upcoming_command_timestamps
+        assert post_state_queue.full(), "Expected post_state_queue to be full"
 
         assert post_queue_start_t >= fst_cmd_t, f"Expected {post_queue_start_t} <= {fst_cmd_t}"
         assert post_queue_start_t >= cmd_t, f"Expected {post_queue_start_t} >= {cmd_t}"
