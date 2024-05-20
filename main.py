@@ -15,28 +15,93 @@ from utils.utils import get_rgb_image
 DATA_PICKLE_FILE = '/tmp/data_FrRL.pkl'
 
 
-def _feature_extraction(X):
+def _feature_extraction(xs):
     # feature extraction
     numerical_features = []
 
-    for state, t in X['states']:
+    for state, t in xs['states']:
         numerical_features.append(state.twist.twist.linear.x)
         numerical_features.append(state.twist.twist.linear.y)
         numerical_features.append(state.twist.twist.linear.z)
 
     # get images and convert them to RGB
     imgs = []
-    for img, t in X['imgs']:
+    for img, t in xs['imgs']:
         imgs.append(get_rgb_image(img))
 
     return np.array(numerical_features), np.array(imgs)
 
 
-def _label_extraction(y):
+def _label_extraction(ys):
     # label extraction
 
-    # TODO: implement label extraction
-    return [1, 0, 0, 0, 1, 0, 1, 0, 0, 0]
+    print(f"len of ys: {len(ys)}")
+
+    # plot the contact forces /state_estimator/contact_force_lf_foot
+    contact_force_LF_z = [y[0].contacts[0].wrench.force.z for y in ys]
+    contact_force_RF_z = [y[0].contacts[1].wrench.force.z for y in ys]
+    contact_force_LH_z = [y[0].contacts[2].wrench.force.z for y in ys]
+    contact_force_RH_z = [y[0].contacts[3].wrench.force.z for y in ys]
+
+    # map index to time stamps
+    idxs = [y[0].header.stamp.to_sec() for y in ys]
+
+    # plot forces using matplotlib
+    import matplotlib.pyplot as plt
+
+    plt.plot(idxs, contact_force_LF_z, label='LF')
+    plt.plot(idxs, contact_force_RF_z, label='RF')
+    plt.plot(idxs, contact_force_LH_z, label='LH')
+    plt.plot(idxs, contact_force_RH_z, label='RH')
+
+    # set title
+    time_stamp = ys[150][0].header.stamp.to_sec()
+
+    # convert time to humain readable format
+    import datetime
+    time_stamp = datetime.datetime.fromtimestamp(time_stamp).strftime('%Y-%m-%d %H:%M:%S')
+    plt.title(f'Contact forces [Time {time_stamp}]')
+
+    # set y min max -100, 500
+    plt.ylim(-100, 500)
+
+    # force legend to be shown in top right corner
+    plt.legend(loc='upper right')
+
+    # plot lable for x and y axis
+    plt.xlabel('Time [s]')
+    plt.ylabel('Force [N]')
+
+    # save plot in folder /tmp
+    plt.savefig(f'/tmp/contact_forces_{ys[150][0].header.stamp.to_sec()}.png')
+    plt.close()
+
+    pos_x = np.array([y[0].pose.pose.position.x for y in ys])
+    pos_y = np.array([y[0].pose.pose.position.y for y in ys])
+    pos_z = np.array([y[0].pose.pose.position.z for y in ys])
+
+    twist_x = np.array([y[0].twist.twist.linear.x for y in ys])
+    twist_y = np.array([y[0].twist.twist.linear.y for y in ys])
+    twist_z = np.array([y[0].twist.twist.linear.z for y in ys])
+
+    # normalize the data
+    pos_x = (pos_x - np.mean(pos_x)) / np.std(pos_x)
+    pos_y = (pos_y - np.mean(pos_y)) / np.std(pos_y)
+    pos_z = (pos_z - np.mean(pos_z)) / np.std(pos_z)
+
+    twist_x = (twist_x - np.mean(twist_x)) / np.std(twist_x)
+    twist_y = (twist_y - np.mean(twist_y)) / np.std(twist_y)
+    twist_z = (twist_z - np.mean(twist_z)) / np.std(twist_z)
+
+    xp_inter, xp_slope = np.polyfit(pos_x, twist_x, 1)
+    yp_inter, yp_slope = np.polyfit(pos_y, twist_y, 1)
+    zp_inter, zp_slope = np.polyfit(pos_z, twist_z, 1)
+
+    xt_inter, xt_slope = np.polyfit(twist_x, pos_x, 1)
+    yt_inter, yt_slope = np.polyfit(twist_y, pos_y, 1)
+    zt_inter, zt_slope = np.polyfit(twist_z, pos_z, 1)
+
+    return [int(xp_inter >= 0), int(xp_slope >= 0)]
 
 
 def _prepare_data(item):
@@ -51,6 +116,8 @@ def train_model(data_set):
 
     # split data into training and validation
     (inputs, targets) = zip(*data_set)
+    print(f"Data set: {len(inputs)} samples")
+    print(f"targets len: {targets[0]}")
     model = Model(num_actions=len(targets[0])).to(device)
 
     # move input and target to device
@@ -112,10 +179,10 @@ def train_model(data_set):
     pre_targets_batches = pre_targets.split(b_size)
 
     # train the model
-    epochs = 2
+    epochs = 10
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.001, amsgrad=True, betas=(0.9, 0.999), eps=1e-6)
-    loss_fn = torch.nn.MSELoss()
+    loss_fn = torch.nn.CrossEntropyLoss()
     model.train()
 
     print("\nTraining the model...")
@@ -125,8 +192,8 @@ def train_model(data_set):
                     total=len(pre_inputs_scalar_batches))
 
         for (_input_scalars_batch, _input_imgs_batch, _target_batch) in pbar:
-            res = model.forward(_input_scalars_batch, _input_imgs_batch)
-            loss = loss_fn(res, _target_batch)
+            logits, res = model.forward(_input_scalars_batch, _input_imgs_batch)
+            loss = loss_fn(logits, _target_batch)
 
             pbar.set_description(f"Epoch: {epoch}/{epochs} | Loss: {loss.item()}")
 
@@ -145,12 +212,13 @@ def train_model(data_set):
 
         count += 1
 
-        res = model.forward(_input_scalars_batch, _input_imgs_batch)
+        logits, res = model.forward(_input_scalars_batch, _input_imgs_batch)
 
         if count == 1:
             print("\n")
             print("Example from the first batch:")
             print(f" » target: {_target_batch[0].to('cpu').detach().numpy()}")
+            print(f" » logits: {logits[0].to('cpu').detach().numpy()}")
             print(f" » result: {res[0].to('cpu').detach().numpy()}")
             print("\n")
 
@@ -161,7 +229,7 @@ def train_model(data_set):
 
 
 def main():
-    force_data_extraction = False
+    force_data_extraction = True
 
     # check if pre-processed data exists in tmp folder
     # or flag to force re-processing
@@ -191,9 +259,14 @@ def extract_data_from_bags():
     print("\nGetting synchronized data")
     synchronized_training_data = data_handler.get_synchronized_dataset(limit=None)
 
+    # run the prepare data function for the first example as a test
+    print("\nRunning prepare data function for the first example as a test")
+    _prepare_data(synchronized_training_data[0])
+
     # prepare data
     # Use the maximum number of available CPU cores for parallel processing
-    num_cores = min(multiprocessing.cpu_count() * 2, 32)
+    # TODO: set back to 32 threads
+    num_cores = min(multiprocessing.cpu_count() * 2, 1)
     print("\nPreparing data with multiprocessing n_cors =", num_cores)
     with multiprocessing.Pool(num_cores) as p:
         training_data = list(

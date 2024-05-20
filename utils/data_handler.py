@@ -187,7 +187,9 @@ class DataHandler:
 
         img_queue = SlidingWindowQueue(maxsize=2)
         state_queue = SlidingWindowQueue(maxsize=5)
-        event_queue = SlidingWindowQueue(maxsize=20)
+
+        # describes the number of events to be considered in the future
+        event_queue = SlidingWindowQueue(maxsize=300)
 
         training_data_tmp = None
         for (command_topic, command_msg, command_t) in tqdm(command_stream):
@@ -220,10 +222,20 @@ class DataHandler:
             # save training data from previous iteration
             if training_data_tmp is not None:
 
+                # check if the event queue is full
+                if not event_queue.full():
+                    print("  skip iteration: warmup event queue")
+                    continue
+
+                events = event_queue.dump_as_array()
                 training_data.append((
                     training_data_tmp,
-                    event_queue.dump_as_array()
+                    events
                 ))
+
+                # put back the events to the queue, as we are going to use them in the next iteration
+                for event in events:
+                    event_queue.put(event.copy())
 
             else:
                 print("  skipping iteration")
