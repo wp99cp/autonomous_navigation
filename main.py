@@ -5,6 +5,8 @@ import pickle
 import numpy as np
 import torch
 from PIL import Image
+from sklearn.model_selection import train_test_split
+from torch.utils.data import TensorDataset, DataLoader
 from torchvision import transforms
 from tqdm import tqdm
 
@@ -14,6 +16,65 @@ from utils.utils import get_rgb_image
 
 DATA_PICKLE_FILE = '/tmp/data_FrRL.pkl'
 CREATE_PLOTS = False
+
+
+class DatasetWithMeta(torch.utils.data.Dataset):
+    # prepare imgs for resnet
+    preprocess = transforms.Compose([
+        transforms.Resize(256),
+        transforms.CenterCrop(224),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
+
+    def __init__(self, _data):
+        super().__init__()
+
+        self.len = len(_data)
+
+        self.imgs = []
+        self.metas = []
+
+        input_combined, self.targets = zip(*_data)
+
+        for (input_scalars, input_img, _) in input_combined:
+
+            # prepare images
+            prepared_imgs = []
+            for img in input_img:
+                prepared_imgs.append(self.preprocess(Image.fromarray(img)).float())
+            self.imgs.append(prepared_imgs)
+            del prepared_imgs
+            self.metas.append(input_scalars)
+
+        del input_combined
+        del _data
+        del _
+
+        # convert targets from boolean to float
+        self.targets = np.array(self.targets).astype(np.float32)
+        self.targets = torch.tensor(self.targets)
+
+        # convert metas to float tensor
+        self.metas = np.array(self.metas).astype(np.float32)
+        self.metas = torch.tensor(self.metas)
+
+        print(f"Dataset with {self.len} samples created")
+
+    def __len__(self):
+        return self.len
+
+    def meta_len(self):
+        return len(self.metas[0])
+
+    def img_len(self):
+        return len(self.imgs[0])
+
+    def target_len(self):
+        return len(self.targets[0])
+
+    def __getitem__(self, index):
+        return self.imgs[index], self.metas[index], self.targets[index]
 
 
 def _feature_extraction(xs):
@@ -51,6 +112,13 @@ def _label_extraction(ys, xs):
     twist_y = [y.twist.twist.linear.y for y in ys]
     twist_z = [y.twist.twist.linear.z for y in ys]
 
+    command = xs['command']
+
+    ##############################################################
+    ##############################################################
+    ##############################################################
+    ##############################################################
+
     # map index to time stamps
     idxs = [y.header.stamp.to_sec() for y in ys]
 
@@ -72,9 +140,9 @@ def _label_extraction(ys, xs):
         plt4 = ax[1][1]
 
         # plot vertical lines at command timestamps
-        command = xs['command']
         cmd_timestamps = [x.to_sec() for x in xs['commands_timestamp']]
         cmd_timestamps = np.array(cmd_timestamps)
+
         for p in [plt1, plt2, plt4]:
             for i, cmd_timestamp in enumerate(cmd_timestamps):
                 if i == 0:
@@ -145,7 +213,22 @@ def _label_extraction(ys, xs):
         # close the plot
         plt.close(fig)
 
-    return [0, 1, 2, 3]
+    ##############################################################
+    ##############################################################
+    ##############################################################
+    ##############################################################
+
+    # check for higth contact forces
+    contact_force_threshold = 450
+    has_high_contact_force = (max(contact_force_LF_z) > contact_force_threshold or
+                              max(contact_force_RF_z) > contact_force_threshold or
+                              max(contact_force_LH_z) > contact_force_threshold or
+                              max(contact_force_RH_z) > contact_force_threshold)
+
+    command_twist_x = command.twist.linear.x
+    mean_error_command_twist_x = np.mean(np.abs(np.array(twist_x) - command_twist_x))
+
+    return [mean_error_command_twist_x >= 0.2, has_high_contact_force]
 
 
 def _prepare_data(item):
@@ -153,91 +236,38 @@ def _prepare_data(item):
     return _feature_extraction(xs), _label_extraction(y, xs)
 
 
-def train_model(data_set):
+def train_model(train_loader: DataLoader[DatasetWithMeta], test_loader: DataLoader[DatasetWithMeta]):
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-
     print("Start training model on device:", device)
 
-    # split data into training and validation
-    (inputs, targets) = zip(*data_set)
-    print(f"Data set: {len(inputs)} samples")
-    print(f"targets len: {targets[0]}")
-    model = Model(num_actions=len(targets[0])).to(device)
-
-    # move input and target to device
-    inputs_scalar = [torch.tensor(t[0]) for t in inputs]
-    inputs_images = [t[1] for t in inputs]
-    targets = [torch.tensor(t) for t in targets]
-
-    # prepare data for resnet
-    preprocess = transforms.Compose([
-        transforms.Resize(256),
-        transforms.CenterCrop(224),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-    ])
-
-    pre_inputs_scalar = []
-    pre_inputs_images = []
-    pre_targets = []
-
-    # pre-precess data for training
-    print("\nPre-processing data for training...")
-    for (_input_scalars, _input_imgs, _target) in tqdm(zip(inputs_scalar, inputs_images, targets),
-                                                       total=len(inputs_scalar)):
-        # extract images
-        img1 = Image.fromarray(_input_imgs[0])
-        img2 = Image.fromarray(_input_imgs[1])
-
-        img1 = preprocess(img1)
-        img2 = preprocess(img2)
-
-        # covert everything to float tensor
-        _input_scalars = _input_scalars.float()
-        _target = _target.float()
-        img1 = img1.float()
-        img2 = img2.float()
-
-        # move everything to device
-        _input_scalars = _input_scalars.to(device)
-        _target = _target.to(device)
-        img1 = img1.to(device)
-        img2 = img2.to(device)
-
-        pre_inputs_scalar.append(_input_scalars)
-        pre_inputs_images.append(img1)  # TODO: add img2
-        pre_targets.append(_target)
-
-    print("\nFinished pre-processing data for training.")
-
-    # convert data to batches of tensors
-    b_size = 32
-
-    # to tensor batches
-    pre_inputs_scalar = torch.stack(pre_inputs_scalar)
-    pre_inputs_images = torch.stack(pre_inputs_images)
-    pre_targets = torch.stack(pre_targets)
-
-    pre_inputs_scalar_batches = pre_inputs_scalar.split(b_size)
-    pre_inputs_images_batches = pre_inputs_images.split(b_size)
-    pre_targets_batches = pre_targets.split(b_size)
+    # initialize the model
+    first_element: DatasetWithMeta = train_loader.dataset
+    model = Model(num_actions=first_element.target_len()).to(device)
+    del first_element
 
     # train the model
-    epochs = 10
+    epochs = 5
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.001, amsgrad=True, betas=(0.9, 0.999), eps=1e-6)
     loss_fn = torch.nn.CrossEntropyLoss()
     model.train()
 
     print("\nTraining the model...")
+    rolling_mean_loss = None
+
     for epoch in range(epochs):
 
-        pbar = tqdm(zip(pre_inputs_scalar_batches, pre_inputs_images_batches, pre_targets_batches),
-                    total=len(pre_inputs_scalar_batches))
+        pbar = tqdm(train_loader, total=len(train_loader))
+        for i, (_input_imgs, _input_scalars, _target) in enumerate(pbar):
+            _input_imgs, _input_scalars, _target = prepare_on(_input_imgs, _input_scalars, _target, device)
 
-        for (_input_scalars_batch, _input_imgs_batch, _target_batch) in pbar:
-            logits, res = model.forward(_input_scalars_batch, _input_imgs_batch)
-            loss = loss_fn(logits, _target_batch)
+            logits, res = model.forward(_input_scalars, _input_imgs)
+            loss = loss_fn(logits, _target)
+
+            if rolling_mean_loss is None:
+                rolling_mean_loss = loss.item()
+            else:
+                rolling_mean_loss = (i * rolling_mean_loss + loss.item()) / (i + 1)
 
             pbar.set_description(f"Epoch: {epoch}/{epochs} | Loss: {loss.item()}")
 
@@ -250,30 +280,47 @@ def train_model(data_set):
     count = 0
 
     print("\nTesting the model...")
-    for (_input_scalars_batch, _input_imgs_batch, _target_batch) in \
-            tqdm(zip(pre_inputs_scalar_batches, pre_inputs_images_batches, pre_targets_batches),
-                 total=len(pre_inputs_scalar_batches)):
+    for _input_imgs, _input_scalars, _target in test_loader:
+        _input_imgs, _input_scalars, _target = prepare_on(_input_imgs, _input_scalars, _target, device)
 
         count += 1
 
-        logits, res = model.forward(_input_scalars_batch, _input_imgs_batch)
+        logits, res = model.forward(_input_scalars, _input_imgs)
 
-        if count == 1:
+        if count == 0:
             print("\n")
             print("Example from the first batch:")
-            print(f" » target: {_target_batch[0].to('cpu').detach().numpy()}")
-            print(f" » logits: {logits[0].to('cpu').detach().numpy()}")
-            print(f" » result: {res[0].to('cpu').detach().numpy()}")
+
+        if count <= 25:
+            print(
+                f" » target: {_target[0].to('cpu').detach().numpy()} vs result: {res[0].to('cpu').detach().numpy()}")
+
+        if count == 25:
             print("\n")
 
-        mean_mse += torch.nn.functional.mse_loss(res, _target_batch).to('cpu').detach().numpy()
+        mean_mse += torch.nn.functional.mse_loss(res, _target).to('cpu').detach().numpy()
 
-    mean_mse /= len(inputs_scalar)
+    mean_mse /= test_loader.__len__()
     print(f"Mean MSE: {mean_mse}")
 
 
+def prepare_on(_input_imgs, _input_scalars, _target, device):
+    # to cuda
+    _input_imgs = _input_imgs
+    _input_scalars = _input_scalars
+    # covert everything to float tensor
+    _input_scalars = _input_scalars
+    _target = _target
+    _input_imgs = _input_imgs[0]
+    # move everything to device
+    _input_scalars = _input_scalars.to(device)
+    _target = _target.to(device)
+    _input_imgs = _input_imgs.to(device)
+    return _input_imgs, _input_scalars, _target
+
+
 def main():
-    force_data_extraction = True
+    force_data_extraction = False
 
     # check if pre-processed data exists in tmp folder
     # or flag to force re-processing
@@ -283,13 +330,24 @@ def main():
     # load pre-processed data
     data_set = pickle.load(open(DATA_PICKLE_FILE, 'rb'))
     assert data_set is not None, "Data set is None"
-    print(f"Data set loaded: {len(data_set)} samples")
 
-    train_model(data_set)
+    print(f"Data set loaded: {len(data_set)} samples")
+    train_set, test_set = train_test_split(data_set, test_size=0.2)
+
+    # unzip the train_set and convert it to a tensor dataset
+    dataset_train = DatasetWithMeta(train_set)
+    dataset_loader_train = torch.utils.data.DataLoader(
+        dataset_train, batch_size=32, shuffle=True, num_workers=8, pin_memory=True
+    )
+
+    dataset_test = DatasetWithMeta(test_set)
+    dataset_loader_test = torch.utils.data.DataLoader(dataset_test, batch_size=32, shuffle=False)
+
+    train_model(dataset_loader_train, dataset_loader_test)
 
 
 def extract_data_from_bags():
-    bags_base_dir = 'data/20230302_Hoengg_Forst_Dodo/mission_data/'
+    bags_base_dir = 'data/RosBags/raw/'
 
     # list all folders in the base directory
     dirs = os.listdir(bags_base_dir)
@@ -300,67 +358,70 @@ def extract_data_from_bags():
         lpc_bag_file = None
         npc_bag_file = None
 
-        for f in os.listdir(bags_base_dir + d):
-            if 'jetson' in f:
-                jetson_bag_file = bags_base_dir + d + '/' + f
-            if 'lpc' in f:
-                lpc_bag_file = bags_base_dir + d + '/' + f
-            if 'npc' in f:
-                npc_bag_file = bags_base_dir + d + '/' + f
+        for i in range(0, 10):
 
-        assert jetson_bag_file is not None, "Jetson bag file not found"
-        assert lpc_bag_file is not None, "LPC bag file not found"
-        assert npc_bag_file is not None, "NPC bag file not found"
+            for f in os.listdir(bags_base_dir + d):
+                if 'jetson' in f and '_' + str(i) + '.bag' in f:
+                    jetson_bag_file = bags_base_dir + d + '/' + f
+                if 'lpc' in f and '_' + str(i) + '.bag' in f:
+                    lpc_bag_file = bags_base_dir + d + '/' + f
+                if 'npc' in f and '_' + str(i) + '.bag' in f:
+                    npc_bag_file = bags_base_dir + d + '/' + f
 
-        print("\nProcessing bags:")
-        print(f" » {jetson_bag_file.split('/')[-1]}, {lpc_bag_file.split('/')[-1]}, {npc_bag_file.split('/')[-1]}")
-
-        try:
-
-            data_handler = DataHandler(
-                jetson_bag_file=jetson_bag_file,
-                lpc_bag_file=lpc_bag_file,
-                npc_bag_file=npc_bag_file,
-                print_details=False
-            )
-
-            data_handler.load_data()
-
-            # get synchronized data
-            print("\nGetting synchronized data")
-            synchronized_training_data = data_handler.get_synchronized_dataset(limit=None)
-
-            if synchronized_training_data is None or len(synchronized_training_data) == 0:
-                print("No synchronized data found")
+            if jetson_bag_file is None or lpc_bag_file is None or npc_bag_file is None:
                 continue
 
-            # run the prepare data function for the first example as a test
-            print("\nRunning prepare data function for the first example as a test")
-            _prepare_data(synchronized_training_data[0])
-            continue
+            print("\nProcessing bags:")
+            print(f" » {jetson_bag_file.split('/')[-1]}, {lpc_bag_file.split('/')[-1]}, {npc_bag_file.split('/')[-1]}")
 
-            # prepare data
-            # Use the maximum number of available CPU cores for parallel processing
-            num_cores = min(multiprocessing.cpu_count() * 2, 32)
-            print("\nPreparing data with multiprocessing n_cors =", num_cores)
-            with multiprocessing.Pool(num_cores) as p:
-                training_data = list(
-                    tqdm(p.imap(_prepare_data, synchronized_training_data), total=len(synchronized_training_data)))
-            print(f"\nTraining data: {len(training_data)} samples")
+            try:
 
-            # TODO: remove the following line
-            # training_data = training_data[:100]
+                data_handler = DataHandler(
+                    jetson_bag_file=jetson_bag_file,
+                    lpc_bag_file=lpc_bag_file,
+                    npc_bag_file=npc_bag_file,
+                    print_details=False
+                )
 
-            # save data as a pickle file
-            print("\nSaving data to", DATA_PICKLE_FILE)
-            pickle.dump(training_data, open(DATA_PICKLE_FILE, 'wb'))
-            print("\nData saved to", DATA_PICKLE_FILE)
+                data_handler.load_data()
 
-            # report the time taken for each method
-            data_handler.report_time()
+                # get synchronized data
+                print("\nGetting synchronized data")
+                synchronized_training_data = data_handler.get_synchronized_dataset(limit=None)
 
-        except Exception as e:
-            print(f"Error processing bags: {e}")
+                if synchronized_training_data is None or len(synchronized_training_data) == 0:
+                    print("No synchronized data found")
+                    continue
+
+                # run the prepare data function for the first example as a test
+                print("\nRunning prepare data function for the first example as a test")
+                _prepare_data(synchronized_training_data[0])
+
+                # prepare data
+                # Use the maximum number of available CPU cores for parallel processing
+                num_cores = min(multiprocessing.cpu_count() * 2, 32)
+                print("\nPreparing data with multiprocessing n_cors =", num_cores)
+                with multiprocessing.Pool(num_cores) as p:
+                    training_data = list(
+                        tqdm(p.imap(_prepare_data, synchronized_training_data), total=len(synchronized_training_data)))
+                print(f"\nTraining data: {len(training_data)} samples")
+
+                # TODO: remove the following line
+                # training_data = training_data[:100]
+
+                # save data as a pickle file
+                print("\nSaving data to", DATA_PICKLE_FILE)
+                pickle.dump(training_data, open(DATA_PICKLE_FILE, 'wb'))
+                print("\nData saved to", DATA_PICKLE_FILE)
+
+                # report the time taken for each method
+                data_handler.report_time()
+
+            except Exception as e:
+                print(f"Error processing bags: {e}")
+
+            # TODO: remove
+            return
 
 
 if __name__ == "__main__":
