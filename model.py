@@ -12,7 +12,7 @@ class Model(nn.Module):
         weights = ResNet18_Weights.IMAGENET1K_V1
         self.resnet18 = models.resnet18(weights=weights)
 
-        self.n_concat = 512 + 15  # 1000 from the resnet18 and 15 from the scalar features
+        self.n_concat = 512 + 30  # 1000 from the resnet18 and 15 from the scalar features
 
         # define the dense layers
         self.fc0 = nn.Linear(1000, 512)

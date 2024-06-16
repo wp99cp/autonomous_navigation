@@ -4,77 +4,18 @@ import pickle
 
 import numpy as np
 import torch
-from PIL import Image
+from matplotlib import pyplot as plt
 from sklearn.model_selection import train_test_split
 from torch.utils.data import TensorDataset, DataLoader
-from torchvision import transforms
 from tqdm import tqdm
 
 from model import Model
 from utils.data_handler import DataHandler
+from utils.dataset_with_meta import DatasetWithMeta
 from utils.utils import get_rgb_image
 
 DATA_PICKLE_FILE = '/tmp/data_FrRL.pkl'
 CREATE_PLOTS = False
-
-
-class DatasetWithMeta(torch.utils.data.Dataset):
-    # prepare imgs for resnet
-    preprocess = transforms.Compose([
-        transforms.Resize(256),
-        transforms.CenterCrop(224),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-    ])
-
-    def __init__(self, _data):
-        super().__init__()
-
-        self.len = len(_data)
-
-        self.imgs = []
-        self.metas = []
-
-        input_combined, self.targets = zip(*_data)
-
-        for (input_scalars, input_img, _) in input_combined:
-
-            # prepare images
-            prepared_imgs = []
-            for img in input_img:
-                prepared_imgs.append(self.preprocess(Image.fromarray(img)).float())
-            self.imgs.append(prepared_imgs)
-            del prepared_imgs
-            self.metas.append(input_scalars)
-
-        del input_combined
-        del _data
-        del _
-
-        # convert targets from boolean to float
-        self.targets = np.array(self.targets).astype(np.float32)
-        self.targets = torch.tensor(self.targets)
-
-        # convert metas to float tensor
-        self.metas = np.array(self.metas).astype(np.float32)
-        self.metas = torch.tensor(self.metas)
-
-        print(f"Dataset with {self.len} samples created")
-
-    def __len__(self):
-        return self.len
-
-    def meta_len(self):
-        return len(self.metas[0])
-
-    def img_len(self):
-        return len(self.imgs[0])
-
-    def target_len(self):
-        return len(self.targets[0])
-
-    def __getitem__(self, index):
-        return self.imgs[index], self.metas[index], self.targets[index]
 
 
 def _feature_extraction(xs):
@@ -85,6 +26,17 @@ def _feature_extraction(xs):
         numerical_features.append(state.twist.twist.linear.x)
         numerical_features.append(state.twist.twist.linear.y)
         numerical_features.append(state.twist.twist.linear.z)
+
+        numerical_features.append(state.twist.twist.angular.x)
+        numerical_features.append(state.twist.twist.angular.y)
+        numerical_features.append(state.twist.twist.angular.z)
+
+    # normalize numerical features using [-2, 2]
+    numerical_features = np.array(numerical_features)
+    numerical_features = (numerical_features - 2.) / 4.
+
+    # clip the values to [-1, 1]
+    numerical_features = np.clip(numerical_features, -1., 1.)
 
     # get images and convert them to RGB
     imgs = []
@@ -131,8 +83,6 @@ def _label_extraction(ys, xs):
 
     # plot forces using matplotlib
     if CREATE_PLOTS:
-        import matplotlib.pyplot as plt
-
         fig, ax = plt.subplots(2, 2, figsize=(15, 10))
         plt1 = ax[0][0]
         plt2 = ax[0][1]
@@ -218,17 +168,55 @@ def _label_extraction(ys, xs):
     ##############################################################
     ##############################################################
 
-    # check for higth contact forces
-    contact_force_threshold = 450
+    ##############################################################
+    # stumbling / slippering
+    # is calculated based on the feet velocities
+    ##############################################################
+
+    # calculate the velocity of the feet
+    velocity_LF = np.diff(position_LF_z, n=1)
+    velocity_RF = np.diff(position_RF_z, n=1)
+    velocity_LH = np.diff(position_LH_z, n=1)
+    velocity_RH = np.diff(position_RH_z, n=1)
+
+    # calculate the mean velocity
+    max_velocity_LF = np.max(np.abs(velocity_LF))
+    max_velocity_RF = np.max(np.abs(velocity_RF))
+    max_velocity_LH = np.max(np.abs(velocity_LH))
+    max_velocity_RH = np.max(np.abs(velocity_RH))
+
+    # check if the mean velocity is above a threshold
+    velocity_threshold = 11e-3
+    has_stumbling = (max_velocity_LF > velocity_threshold or
+                     max_velocity_RF > velocity_threshold or
+                     max_velocity_LH > velocity_threshold or
+                     max_velocity_RH > velocity_threshold)
+
+    ##############################################################
+    # misplaced feets
+    # is calculated based on the contact forces
+    ##############################################################
+
+    contact_force_threshold = 600
     has_high_contact_force = (max(contact_force_LF_z) > contact_force_threshold or
                               max(contact_force_RF_z) > contact_force_threshold or
                               max(contact_force_LH_z) > contact_force_threshold or
                               max(contact_force_RH_z) > contact_force_threshold)
+    has_misplaced_feets = has_high_contact_force
 
+    ##############################################################
+    # unable to follow commands
+    # is calculated by the difference between the command and the actual twist.linear.x
+    ##############################################################
     command_twist_x = command.twist.linear.x
     mean_error_command_twist_x = np.mean(np.abs(np.array(twist_x) - command_twist_x))
+    is_unable_to_follow_commands = mean_error_command_twist_x >= 0.18
 
-    return [mean_error_command_twist_x >= 0.2, has_high_contact_force]
+    ##############################################################
+    # report the results
+    ##############################################################
+
+    return [is_unable_to_follow_commands, has_misplaced_feets, has_stumbling]
 
 
 def _prepare_data(item):
@@ -242,14 +230,32 @@ def train_model(train_loader: DataLoader[DatasetWithMeta], test_loader: DataLoad
 
     # initialize the model
     first_element: DatasetWithMeta = train_loader.dataset
-    model = Model(num_actions=first_element.target_len()).to(device)
+    num_actions = first_element.target_len()
+    model = Model(num_actions=num_actions).to(device)
     del first_element
 
     # train the model
-    epochs = 5
+    epochs = 10
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=0.001, amsgrad=True, betas=(0.9, 0.999), eps=1e-6)
-    loss_fn = torch.nn.CrossEntropyLoss()
+    # calc training imbalance
+    compensate_imbalance = True
+    if compensate_imbalance:
+        targets = train_loader.dataset.targets
+        class_weights = torch.tensor([
+            1. / (targets[:, i].sum() / len(targets)) for i in range(targets.shape[1])
+        ]).to(device)
+
+        # apply root transform
+        class_weights = torch.sqrt(class_weights)
+
+        # max to 10
+        class_weights = torch.clamp(class_weights, 0, 10)
+        print("Class weights:", class_weights)
+    else:
+        class_weights = None
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.00001, amsgrad=True, betas=(0.9, 0.999), eps=1e-6)
+    loss_fn = torch.nn.BCELoss(weight=class_weights)
     model.train()
 
     print("\nTraining the model...")
@@ -262,22 +268,49 @@ def train_model(train_loader: DataLoader[DatasetWithMeta], test_loader: DataLoad
             _input_imgs, _input_scalars, _target = prepare_on(_input_imgs, _input_scalars, _target, device)
 
             logits, res = model.forward(_input_scalars, _input_imgs)
-            loss = loss_fn(logits, _target)
+            loss = loss_fn(res, _target)
 
             if rolling_mean_loss is None:
                 rolling_mean_loss = loss.item()
             else:
                 rolling_mean_loss = (i * rolling_mean_loss + loss.item()) / (i + 1)
 
-            pbar.set_description(f"Epoch: {epoch}/{epochs} | Loss: {loss.item()}")
+            train_mse = torch.nn.functional.mse_loss(res, _target).to('cpu').detach().numpy()
+            pbar.set_description(f"{epoch}/{epochs} | LOSS: {loss.item():.6f} | MSE: {train_mse:.3f} | "
+                                 f"RLoss: {rolling_mean_loss:.3f}")
 
             # run backpropagation
             loss.backward()
             optimizer.step()
+            optimizer.zero_grad()
+
+        # calc test loss
+        mean_mse = 0
+        count = 0
+        model.eval()
+
+        for _input_imgs, _input_scalars, _target in test_loader:
+            _input_imgs, _input_scalars, _target = prepare_on(_input_imgs, _input_scalars, _target, device)
+
+            count += 1
+
+            logits, res = model.forward(_input_scalars, _input_imgs)
+            mean_mse += torch.nn.functional.mse_loss(res, _target).to('cpu').detach().numpy()
+
+        mean_mse /= test_loader.__len__()
+        print(f"Epoch: {epoch}/{epochs} | Loss: {loss.item():.6f} | Test MSE: {mean_mse:.3f}")
 
     # test the model performance
     mean_mse = 0
+    accuracy_05 = 0
+    accuracy_10 = 0
+    accuracy_20 = 0
+
     count = 0
+    model.eval()
+
+    # save model parameters
+    torch.save(model.state_dict(), 'model_params.pth')
 
     print("\nTesting the model...")
     for _input_imgs, _input_scalars, _target in test_loader:
@@ -292,26 +325,31 @@ def train_model(train_loader: DataLoader[DatasetWithMeta], test_loader: DataLoad
             print("Example from the first batch:")
 
         if count <= 25:
-            print(
-                f" » target: {_target[0].to('cpu').detach().numpy()} vs result: {res[0].to('cpu').detach().numpy()}")
+            result = res[0].to('cpu').detach().numpy()
+
+            # format result to be more readable (2 decimal places, no scientific notation)
+            result = [f'{x:.4f}' for x in result]
+            print(f" » target: {_target[0].to('cpu').detach().numpy()} vs result: {result}")
 
         if count == 25:
             print("\n")
 
         mean_mse += torch.nn.functional.mse_loss(res, _target).to('cpu').detach().numpy()
+        accuracy_05 += torch.sum(torch.abs(res - _target) < 0.05).to('cpu').detach().numpy()
+        accuracy_10 += torch.sum(torch.abs(res - _target) < 0.1).to('cpu').detach().numpy()
+        accuracy_20 += torch.sum(torch.abs(res - _target) < 0.2).to('cpu').detach().numpy()
 
     mean_mse /= test_loader.__len__()
     print(f"Mean MSE: {mean_mse}")
+    print(f"Accuracy [0.05]: {accuracy_05 / (test_loader.__len__() * test_loader.batch_size * num_actions) * 100:.2f}%")
+    print(f"Accuracy  [0.1]: {accuracy_10 / (test_loader.__len__() * test_loader.batch_size * num_actions) * 100:.2f}%")
+    print(f"Accuracy  [0.2]: {accuracy_20 / (test_loader.__len__() * test_loader.batch_size * num_actions) * 100:.2f}%")
 
 
 def prepare_on(_input_imgs, _input_scalars, _target, device):
-    # to cuda
-    _input_imgs = _input_imgs
-    _input_scalars = _input_scalars
-    # covert everything to float tensor
-    _input_scalars = _input_scalars
-    _target = _target
+    # we only use the first image
     _input_imgs = _input_imgs[0]
+
     # move everything to device
     _input_scalars = _input_scalars.to(device)
     _target = _target.to(device)
@@ -320,12 +358,15 @@ def prepare_on(_input_imgs, _input_scalars, _target, device):
 
 
 def main():
+    # TODO: set limit to -1 to process all data
+    # force data extraction and limit the number of samples
     force_data_extraction = False
+    limit = -1
 
     # check if pre-processed data exists in tmp folder
     # or flag to force re-processing
     if not os.path.exists(DATA_PICKLE_FILE) or force_data_extraction:
-        extract_data_from_bags()
+        extract_data_from_bags(limit=limit)
 
     # load pre-processed data
     data_set = pickle.load(open(DATA_PICKLE_FILE, 'rb'))
@@ -343,15 +384,35 @@ def main():
     dataset_test = DatasetWithMeta(test_set)
     dataset_loader_test = torch.utils.data.DataLoader(dataset_test, batch_size=32, shuffle=False)
 
+    # calc dataset imbalance for each target
+    print("\n")
+    print("Dataset imbalance [train]:")
+    targets = dataset_train.targets
+    target_names = ['unable_to_follow_commands', 'has_misplaced_feets', 'has_stumbling']
+    for i in range(targets.shape[1]):
+        print(f" » {target_names[i]} (target  {i}): {targets[:, i].sum() / len(targets) * 100:.2f}%")
+    print("\n")
+
+    # calc dataset imbalance for each target
+    print("\n")
+    print("Dataset imbalance [test]:")
+    targets = dataset_test.targets
+    for i in range(targets.shape[1]):
+        print(f" » {target_names[i]} (target  {i}): {targets[:, i].sum() / len(targets) * 100:.2f}%")
+    print("\n")
+
     train_model(dataset_loader_train, dataset_loader_test)
 
 
-def extract_data_from_bags():
+def extract_data_from_bags(limit=-1):
     bags_base_dir = 'data/RosBags/raw/'
 
     # list all folders in the base directory
     dirs = os.listdir(bags_base_dir)
 
+    dataset = []
+
+    count = 0
     for d in dirs:
         # find jetson, lpc and npc bag files
         jetson_bag_file = None
@@ -359,6 +420,11 @@ def extract_data_from_bags():
         npc_bag_file = None
 
         for i in range(0, 10):
+
+            # check if the limit is reached
+            if count == limit:
+                break
+            count += 1
 
             for f in os.listdir(bags_base_dir + d):
                 if 'jetson' in f and '_' + str(i) + '.bag' in f:
@@ -406,22 +472,24 @@ def extract_data_from_bags():
                         tqdm(p.imap(_prepare_data, synchronized_training_data), total=len(synchronized_training_data)))
                 print(f"\nTraining data: {len(training_data)} samples")
 
-                # TODO: remove the following line
-                # training_data = training_data[:100]
-
-                # save data as a pickle file
-                print("\nSaving data to", DATA_PICKLE_FILE)
-                pickle.dump(training_data, open(DATA_PICKLE_FILE, 'wb'))
-                print("\nData saved to", DATA_PICKLE_FILE)
-
-                # report the time taken for each method
+                dataset.extend(training_data)
                 data_handler.report_time()
 
             except Exception as e:
                 print(f"Error processing bags: {e}")
 
-            # TODO: remove
-            return
+    # total number of samples
+    print(f"\nTotal number of samples: {len(dataset)}")
+
+    # save data as a pickle file
+    print("\nSaving data to", DATA_PICKLE_FILE)
+
+    # check if the file exists
+    if os.path.exists(DATA_PICKLE_FILE):
+        os.remove(DATA_PICKLE_FILE)
+
+    pickle.dump(dataset, open(DATA_PICKLE_FILE, 'wb'))
+    print("\nData saved to", DATA_PICKLE_FILE)
 
 
 if __name__ == "__main__":
