@@ -14,7 +14,7 @@ class Model(nn.Module):
         self.resnet18 = models.resnet18(weights=weights)
 
         self.action_size = 2
-        self.feature_size = 30
+        self.feature_size = 330
         self.n_concat = 512 + 96  # 512 from the resnet18 and 15 from the scalar features
 
         self.dfeat = nn.Linear(self.feature_size, 96)
@@ -34,9 +34,9 @@ class Model(nn.Module):
         self.lstm = nn.LSTM(input_size=128 + 32, hidden_size=128, num_layers=1, batch_first=True)
         self.fc4 = nn.Linear(128, num_events)
 
-        self.dropout1 = nn.Dropout(0.2)
-        self.dropout2 = nn.Dropout(0.2)
-        self.dropout3 = nn.Dropout(0.2)
+        self.dropout1 = nn.Dropout(0.4)
+        self.dropout2 = nn.Dropout(0.4)
+        self.dropout3 = nn.Dropout(0.4)
 
         self.batch_norm = nn.BatchNorm1d(self.n_concat)
 

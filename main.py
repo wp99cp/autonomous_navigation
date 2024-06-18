@@ -5,6 +5,9 @@ import pickle
 import numpy as np
 import torch
 from matplotlib import pyplot as plt
+from sklearn.metrics import accuracy_score, precision_score, recall_score
+from sklearn.metrics import roc_auc_score
+from sklearn.metrics import roc_curve
 from sklearn.model_selection import train_test_split
 from torch.utils.data import TensorDataset, DataLoader
 from tqdm import tqdm
@@ -61,12 +64,16 @@ def _feature_extraction(xs, ys):
         numerical_features.append(state.twist.twist.angular.y)
         numerical_features.append(state.twist.twist.angular.z)
 
-    # normalize numerical features using [-2, 2]
-    numerical_features = np.array(numerical_features)
-    numerical_features = (numerical_features - 2.) / 4.
+        for i in range(4):
+            numerical_features.append(state.contacts[i].wrench.force.x)
+            numerical_features.append(state.contacts[i].wrench.force.y)
+            numerical_features.append(state.contacts[i].wrench.force.z)
 
-    # clip the values to [-1, 1]
-    numerical_features = np.clip(numerical_features, -1., 1.)
+        for i in range(12):
+            numerical_features.append(state.joints.effort[i])
+            numerical_features.append(state.joints.velocity[i])
+            numerical_features.append(state.joints.acceleration[i])
+            numerical_features.append(state.joints.position[i])
 
     command = xs['command']
 
@@ -308,9 +315,21 @@ def train_model(
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.00001, amsgrad=True, betas=(0.9, 0.999), eps=1e-6)
     loss_fn = torch.nn.BCEWithLogitsLoss(pos_weight=class_weights)
-    lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.5)
+    lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.25)
 
     model.train()
+
+    # normalize the features
+    from sklearn.preprocessing import StandardScaler
+    scaler = StandardScaler()
+    action_scaler = StandardScaler()
+
+    # normalize the features
+    for _input_imgs, _input_scalars, _actions, _target in train_loader:
+        scaler.partial_fit(_input_scalars)
+
+        _actions = _actions.reshape(-1, _actions.shape[-1])
+        action_scaler.partial_fit(_actions)
 
     print("\nTraining the model...")
     for epoch in range(epochs):
@@ -321,6 +340,17 @@ def train_model(
 
         pbar = tqdm(train_loader, total=len(train_loader))
         for i, (_input_imgs, _input_scalars, _actions, _target) in enumerate(pbar):
+
+            # normalize the features
+            _input_scalars = scaler.transform(_input_scalars)
+            _actions = _actions.reshape(-1, _actions.shape[-1])
+            _actions = action_scaler.transform(_actions)
+            _actions = _actions.reshape(-1, LOOKBACK, _actions.shape[-1])
+
+            # add random noise to _input_scalars and _actions
+            _input_scalars += np.random.normal(0, 0.05, _input_scalars.shape)
+            _actions += np.random.normal(0, 0.05, _actions.shape)
+
             _input_imgs, _input_scalars, _actions, _target = (
                 prepare_on(_input_imgs, _input_scalars, _actions, _target, device))
 
@@ -348,6 +378,12 @@ def train_model(
         avg_loss = 0.
 
         for _input_imgs, _input_scalars, _actions, _target in test_loader:
+            # normalize the features
+            _input_scalars = scaler.transform(_input_scalars)
+            _actions = _actions.reshape(-1, _actions.shape[-1])
+            _actions = action_scaler.transform(_actions)
+            _actions = _actions.reshape(-1, LOOKBACK, _actions.shape[-1])
+
             _input_imgs, _input_scalars, _actions, _target = (
                 prepare_on(_input_imgs, _input_scalars, _actions, _target, device))
 
@@ -374,20 +410,17 @@ def train_model(
     ##############################################################
 
     targets = []
-    logits = []
     predictions = []
 
     for _input_imgs, _input_scalars, _actions, _target in test_loader:
         _input_imgs, _input_scalars, _actions, _target = prepare_on(_input_imgs, _input_scalars, _actions, _target,
                                                                     device)
 
-        batch_logits, batch_pred = model.forward(_input_scalars, _input_imgs, _actions)
+        _, batch_pred = model.forward(_input_scalars, _input_imgs, _actions)
 
-        logits.append(batch_logits.to('cpu').detach())
         predictions.append(batch_pred.to('cpu').detach())
         targets.append(_target.to('cpu').detach())
 
-    logits = torch.cat(logits, dim=0)
     predictions = torch.cat(predictions, dim=0)
     targets = torch.cat(targets, dim=0)
 
@@ -423,22 +456,16 @@ def calc_matrices(predictions, result_tracker, targets, prefix=''):
     result_tracker.add_metric(f'{prefix}MSE', mse, 'Mean Squared Error')
     for threshold in [0.4, 0.6, 0.75, 0.85, 0.9, 0.99]:
 
-        tp = ((predictions > threshold) & (targets > threshold)).float().sum()
-        tn = ((predictions <= threshold) & (targets <= threshold)).float().sum()
-
-        accuracy = (tp + tn) / targets.numel()
+        accuracy = accuracy_score(targets.flatten() > threshold, predictions.flatten() > threshold)
         result_tracker.add_metric(f'{prefix}ACC@{threshold}', accuracy, f'Accuracy at threshold {threshold}')
 
         for evnt in range(predictions.shape[2]):
-            tp = ((predictions[:, :, evnt] > threshold) & (targets[:, :, evnt] > threshold)).float().sum()
-            tn = ((predictions[:, :, evnt] <= threshold) & (targets[:, :, evnt] <= threshold)).float().sum()
-            fp = ((predictions[:, :, evnt] > threshold) & (targets[:, :, evnt] <= threshold)).float().sum()
-            fn = ((predictions[:, :, evnt] <= threshold) & (targets[:, :, evnt] > threshold)).float().sum()
-
-            precision = tp / (tp + fp + 1e-6)
-            recall = tp / (tp + fn + 1e-6)
+            precision = precision_score(targets[:, :, evnt].flatten() > threshold,
+                                        predictions[:, :, evnt].flatten() > threshold
+                                        )
+            recall = recall_score(targets[:, :, evnt].flatten() > threshold,
+                                  predictions[:, :, evnt].flatten() > threshold)
             f1 = 2 * (precision * recall) / (precision + recall + 1e-6)
-            accuracy = (tp + tn) / (tp + tn + fp + fn)
 
             result_tracker.add_metric(f'{prefix}PRE@{threshold}_{evnt}', precision,
                                       f'Precision at threshold {threshold} for event {evnt}')
@@ -449,16 +476,38 @@ def calc_matrices(predictions, result_tracker, targets, prefix=''):
             result_tracker.add_metric(f'{prefix}ACC@{threshold}_{evnt}', accuracy,
                                       f'Accuracy at threshold {threshold} for event {evnt}')
 
+    # calc roc auc
+    for evnt in range(predictions.shape[2]):
+        roc_auc = roc_auc_score(targets[:, :, evnt], predictions[:, :, evnt])
+        result_tracker.add_metric(f'{prefix}ROC_AUC_{evnt}', roc_auc, f'ROC AUC for event {evnt}')
+
+    # plot the roc curve
+    fpr, tpr, thresholds = roc_curve(targets.flatten(), predictions.flatten())
+    plt.plot(fpr, tpr, label=f'{prefix} ROC curve')
+
+    for t in range(3):
+        fpr, tpr, thresholds = roc_curve(targets[:, :, t].flatten(), predictions[:, :, t].flatten())
+        plt.plot(fpr, tpr, label=f'{prefix} ROC curve target={t}')
+
+    plt.title(f'{prefix}ROC curve')
+    plt.xlabel('False Positive Rate')
+    plt.ylabel('True Positive Rate')
+    plt.savefig(f'/tmp/{prefix}roc_curve.png')
+    # plt.clf()
+
 
 def prepare_on(_input_imgs, _input_scalars, _actions, _target, device):
     # we only use the first image
     _input_imgs = _input_imgs[0]
 
-    # move everything to device
+    _input_scalars = torch.tensor(_input_scalars).float()
+    _actions = torch.tensor(_actions).float()
+
     _actions = _actions.to(device)
     _input_scalars = _input_scalars.to(device)
     _target = _target.to(device)
     _input_imgs = _input_imgs.to(device)
+
     return _input_imgs, _input_scalars, _actions, _target
 
 
@@ -466,7 +515,7 @@ def main():
     # TODO: set limit to -1 to process all data
     # force data extraction and limit the number of samples
     force_data_extraction = False
-    limit = 5
+    limit = -1
 
     # check if pre-processed data exists in tmp folder
     # or flag to force re-processing
@@ -483,19 +532,21 @@ def main():
 
     # we train the model 5 times to get a better average of the results
     result_tracker = ResultTracker()
-    REPEATS = 1
+    REPEATS = 4
     for i in range(REPEATS):
+        plt.clf()
+
         print(f"Data set loaded: {len(data_set)} samples")
         train_set, test_set = train_test_split(data_set, test_size=0.2, shuffle=True)
 
         # unzip the train_set and convert it to a tensor dataset
         dataset_train = DatasetWithMeta(train_set)
         dataset_loader_train = torch.utils.data.DataLoader(
-            dataset_train, batch_size=32, shuffle=True, num_workers=8, pin_memory=True
+            dataset_train, batch_size=128, shuffle=True, num_workers=8, pin_memory=True
         )
 
         dataset_test = DatasetWithMeta(test_set)
-        dataset_loader_test = torch.utils.data.DataLoader(dataset_test, batch_size=32, shuffle=False)
+        dataset_loader_test = torch.utils.data.DataLoader(dataset_test, batch_size=64, shuffle=False)
 
         report_imbalance(dataset_test, dataset_train)
 
