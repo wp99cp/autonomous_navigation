@@ -19,10 +19,14 @@ class DatasetWithMeta(torch.utils.data.Dataset):
 
         self.imgs = []
         self.metas = []
+        self.actions = []
 
         input_combined, self.targets = zip(*_data)
 
-        for (input_scalars, input_img, _) in input_combined:
+        for (input_scalars, input_img, actions, _) in input_combined:
+
+            # prepare actions
+            self.actions.append(actions.astype(np.float32))
 
             # prepare images
             prepared_imgs = []
@@ -59,4 +63,4 @@ class DatasetWithMeta(torch.utils.data.Dataset):
         return len(self.targets[0])
 
     def __getitem__(self, index):
-        return self.imgs[index], self.metas[index], self.targets[index]
+        return self.imgs[index], self.metas[index], self.actions[index], self.targets[index]

@@ -17,8 +17,38 @@ from utils.utils import get_rgb_image
 DATA_PICKLE_FILE = '/tmp/data_FrRL.pkl'
 CREATE_PLOTS = False
 
+LOOKBACK = 3
 
-def _feature_extraction(xs):
+
+class ResultTracker:
+
+    def __init__(self):
+        self.metrics = {}
+
+    def add_metric(self, name, value, description=None):
+        if name not in self.metrics:
+            self.metrics[name] = {
+                'values': [],
+                'description': ''
+            }
+
+        self.metrics[name]['values'].append(value)
+
+        # update the description
+        if description is not None:
+            self.metrics[name]['description'] = description
+
+    def get_metric(self, name):
+        return self.metrics[name]
+
+    def print_summary(self):
+
+        for name, data in sorted(self.metrics.items(), key=lambda x: x[0], reverse=True):
+            name = name.ljust(20)
+            print(f" {name} {np.mean(data['values']):.3f} (std {np.std(data['values']):.3f})  » {data['description']}")
+
+
+def _feature_extraction(xs, ys):
     # feature extraction
     numerical_features = []
 
@@ -38,6 +68,14 @@ def _feature_extraction(xs):
     # clip the values to [-1, 1]
     numerical_features = np.clip(numerical_features, -1., 1.)
 
+    command = xs['command']
+
+    com_x = command.twist.linear.x
+    com_z = command.twist.angular.z
+
+    # TODO: extract actions
+    actions = [[com_x, com_z] for _ in range(LOOKBACK)]
+
     # get images and convert them to RGB
     imgs = []
     times = []
@@ -45,7 +83,7 @@ def _feature_extraction(xs):
         imgs.append(get_rgb_image(img))
         times.append(img.header.stamp)
 
-    return np.array(numerical_features), np.array(imgs), times
+    return np.array(numerical_features), np.array(imgs), np.array(actions), times
 
 
 def _label_extraction(ys, xs):
@@ -216,33 +254,48 @@ def _label_extraction(ys, xs):
     # report the results
     ##############################################################
 
-    return [is_unable_to_follow_commands, has_misplaced_feets, has_stumbling]
+    # TODO: split the labels...
+    labels = [is_unable_to_follow_commands, has_misplaced_feets, has_stumbling]
+    return [labels, labels, labels]
 
 
 def _prepare_data(item):
     xs, y = item
-    return _feature_extraction(xs), _label_extraction(y, xs)
+    return _feature_extraction(xs, y), _label_extraction(y, xs)
 
 
-def train_model(train_loader: DataLoader[DatasetWithMeta], test_loader: DataLoader[DatasetWithMeta]):
+def train_model(
+        train_loader: DataLoader[DatasetWithMeta],
+        test_loader: DataLoader[DatasetWithMeta],
+        result_tracker: ResultTracker
+):
+    print("""
+
+##############################################################
+# Training the model
+##############################################################
+
+
+""")
+
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     print("Start training model on device:", device)
 
     # initialize the model
     first_element: DatasetWithMeta = train_loader.dataset
     num_actions = first_element.target_len()
-    model = Model(num_actions=num_actions).to(device)
+    model = Model(num_events=num_actions).to(device)
     del first_element
 
     # train the model
-    epochs = 10
+    epochs = 15
 
     # calc training imbalance
     compensate_imbalance = True
     if compensate_imbalance:
         targets = train_loader.dataset.targets
         class_weights = torch.tensor([
-            1. / (targets[:, i].sum() / len(targets)) for i in range(targets.shape[1])
+            1. / (targets[:, :, i].sum() / (len(targets) * LOOKBACK)) for i in range(targets.shape[2])
         ]).to(device)
 
         # apply root transform
@@ -250,25 +303,29 @@ def train_model(train_loader: DataLoader[DatasetWithMeta], test_loader: DataLoad
 
         # max to 10
         class_weights = torch.clamp(class_weights, 0, 10)
-        print("Class weights:", class_weights)
     else:
         class_weights = None
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.00001, amsgrad=True, betas=(0.9, 0.999), eps=1e-6)
-    loss_fn = torch.nn.BCELoss(weight=class_weights)
+    loss_fn = torch.nn.BCEWithLogitsLoss(pos_weight=class_weights)
+    lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.5)
+
     model.train()
 
     print("\nTraining the model...")
-    rolling_mean_loss = None
-
     for epoch in range(epochs):
 
-        pbar = tqdm(train_loader, total=len(train_loader))
-        for i, (_input_imgs, _input_scalars, _target) in enumerate(pbar):
-            _input_imgs, _input_scalars, _target = prepare_on(_input_imgs, _input_scalars, _target, device)
+        rolling_mean_loss = None
 
-            logits, res = model.forward(_input_scalars, _input_imgs)
-            loss = loss_fn(res, _target)
+        model.train()
+
+        pbar = tqdm(train_loader, total=len(train_loader))
+        for i, (_input_imgs, _input_scalars, _actions, _target) in enumerate(pbar):
+            _input_imgs, _input_scalars, _actions, _target = (
+                prepare_on(_input_imgs, _input_scalars, _actions, _target, device))
+
+            logits, res = model.forward(_input_scalars, _input_imgs, actions=_actions)
+            loss = loss_fn(logits, _target)
 
             if rolling_mean_loss is None:
                 rolling_mean_loss = loss.item()
@@ -277,106 +334,139 @@ def train_model(train_loader: DataLoader[DatasetWithMeta], test_loader: DataLoad
 
             train_mse = torch.nn.functional.mse_loss(res, _target).to('cpu').detach().numpy()
             pbar.set_description(f"{epoch}/{epochs} | LOSS: {loss.item():.6f} | MSE: {train_mse:.3f} | "
-                                 f"RLoss: {rolling_mean_loss:.3f}")
+                                 f"AVG Loss: {rolling_mean_loss:.3f}")
 
             # run backpropagation
             loss.backward()
             optimizer.step()
-            optimizer.zero_grad()
 
         # calc test loss
         mean_mse = 0
         count = 0
         model.eval()
 
-        for _input_imgs, _input_scalars, _target in test_loader:
-            _input_imgs, _input_scalars, _target = prepare_on(_input_imgs, _input_scalars, _target, device)
+        avg_loss = 0.
+
+        for _input_imgs, _input_scalars, _actions, _target in test_loader:
+            _input_imgs, _input_scalars, _actions, _target = (
+                prepare_on(_input_imgs, _input_scalars, _actions, _target, device))
 
             count += 1
 
-            logits, res = model.forward(_input_scalars, _input_imgs)
+            logits, res = model.forward(_input_scalars, _input_imgs, actions=_actions)
+            loss = loss_fn(logits, _target)
+            avg_loss += loss.item()
             mean_mse += torch.nn.functional.mse_loss(res, _target).to('cpu').detach().numpy()
 
         mean_mse /= test_loader.__len__()
-        print(f"Epoch: {epoch}/{epochs} | Loss: {loss.item():.6f} | Test MSE: {mean_mse:.3f}")
+        avg_loss /= test_loader.__len__()
+        print(f"Epoch: {epoch}/{epochs} | AVG Test Loss: {avg_loss:.6f} | Test MSE: {mean_mse:.3f}")
 
-    # test the model performance
-    mean_mse = 0
-    accuracy_05 = 0
-    accuracy_10 = 0
-    accuracy_20 = 0
-
-    count = 0
-    model.eval()
-
-    accuracy_05_target_0 = 0
-    accuracy_05_target_1 = 0
-    accuracy_05_target_2 = 0
+        old_lr = optimizer.param_groups[0]['lr']
+        lr_scheduler.step()
+        print(f"Learning rate: {old_lr} -> {optimizer.param_groups[0]['lr']}")
 
     # save model parameters
     torch.save(model.state_dict(), 'model_params.pth')
 
-    print("\nTesting the model...")
-    for _input_imgs, _input_scalars, _target in test_loader:
-        _input_imgs, _input_scalars, _target = prepare_on(_input_imgs, _input_scalars, _target, device)
+    ##############################################################
+    # Run Inference
+    ##############################################################
 
-        count += 1
+    targets = []
+    logits = []
+    predictions = []
 
-        logits, res = model.forward(_input_scalars, _input_imgs)
+    for _input_imgs, _input_scalars, _actions, _target in test_loader:
+        _input_imgs, _input_scalars, _actions, _target = prepare_on(_input_imgs, _input_scalars, _actions, _target,
+                                                                    device)
 
-        if count == 0:
-            print("\n")
-            print("Example from the first batch:")
+        batch_logits, batch_pred = model.forward(_input_scalars, _input_imgs, _actions)
 
-        if count <= 25:
-            result = res[0].to('cpu').detach().numpy()
+        logits.append(batch_logits.to('cpu').detach())
+        predictions.append(batch_pred.to('cpu').detach())
+        targets.append(_target.to('cpu').detach())
 
-            # format result to be more readable (2 decimal places, no scientific notation)
-            result = [f'{x:.4f}' for x in result]
-            print(f" » target: {_target[0].to('cpu').detach().numpy()} vs result: {result}")
+    logits = torch.cat(logits, dim=0)
+    predictions = torch.cat(predictions, dim=0)
+    targets = torch.cat(targets, dim=0)
 
-        if count == 25:
-            print("\n")
+    mean_prediction = targets.mean(dim=0)
+    # repeat the mean prediction for all samples
+    mean_prediction = mean_prediction.repeat(predictions.shape[0], 1, 1)
 
-        mean_mse += torch.nn.functional.mse_loss(res, _target).to('cpu').detach().numpy()
-        accuracy_05 += torch.sum(torch.abs(res - _target) < 0.05).to('cpu').detach().numpy()
-        accuracy_10 += torch.sum(torch.abs(res - _target) < 0.1).to('cpu').detach().numpy()
-        accuracy_20 += torch.sum(torch.abs(res - _target) < 0.2).to('cpu').detach().numpy()
+    # print some samples
+    for i in range(5):
+        print(f"Target: {targets[i]}, Prediction: {predictions[i]}")
 
-        accuracy_05_target_0 += torch.sum(torch.abs(res[:, 0] - _target[:, 0]) < 0.05).to('cpu').detach().numpy()
-        accuracy_05_target_1 += torch.sum(torch.abs(res[:, 1] - _target[:, 1]) < 0.05).to('cpu').detach().numpy()
-        accuracy_05_target_2 += torch.sum(torch.abs(res[:, 2] - _target[:, 2]) < 0.05).to('cpu').detach().numpy()
+    ##############################################################
+    # Evaluate the model's performance
+    ##############################################################
 
-    mean_mse /= test_loader.__len__()
-    print(f"Mean MSE: {mean_mse}")
-    print(f"Accuracy [0.05]: {accuracy_05 / (test_loader.__len__() * test_loader.batch_size * num_actions) * 100:.2f}%")
-    print(f"Accuracy  [0.1]: {accuracy_10 / (test_loader.__len__() * test_loader.batch_size * num_actions) * 100:.2f}%")
-    print(f"Accuracy  [0.2]: {accuracy_20 / (test_loader.__len__() * test_loader.batch_size * num_actions) * 100:.2f}%")
+    # calculate the loss
+    loss_fn = torch.nn.BCELoss()
+    loss = loss_fn(predictions, targets)
+    print(f"Final test loss: {loss.item()}")
 
-    print(
-        f"Accuracy [0.05] target 0: {accuracy_05_target_0 / (test_loader.__len__() * test_loader.batch_size) * 100:.2f}%")
-    print(
-        f"Accuracy [0.05] target 1: {accuracy_05_target_1 / (test_loader.__len__() * test_loader.batch_size) * 100:.2f}%")
-    print(
-        f"Accuracy [0.05] target 2: {accuracy_05_target_2 / (test_loader.__len__() * test_loader.batch_size) * 100:.2f}%")
+    loss = loss_fn(mean_prediction, targets)
+    print(f"Final test loss (mean prediction): {loss.item()}")
+
+    calc_matrices(predictions, result_tracker, targets, prefix='Test_')
+    calc_matrices(mean_prediction, result_tracker, targets, prefix='MEAN_')
+
+    print("Model trained and evaluated")
 
 
-def prepare_on(_input_imgs, _input_scalars, _target, device):
+def calc_matrices(predictions, result_tracker, targets, prefix=''):
+    # calculate the mse
+    mse = torch.nn.functional.mse_loss(predictions, targets).to('cpu').detach().numpy()
+    result_tracker.add_metric(f'{prefix}MSE', mse, 'Mean Squared Error')
+    for threshold in [0.4, 0.6, 0.75, 0.85, 0.9, 0.99]:
+
+        tp = ((predictions > threshold) & (targets > threshold)).float().sum()
+        tn = ((predictions <= threshold) & (targets <= threshold)).float().sum()
+
+        accuracy = (tp + tn) / targets.numel()
+        result_tracker.add_metric(f'{prefix}ACC@{threshold}', accuracy, f'Accuracy at threshold {threshold}')
+
+        for evnt in range(predictions.shape[2]):
+            tp = ((predictions[:, :, evnt] > threshold) & (targets[:, :, evnt] > threshold)).float().sum()
+            tn = ((predictions[:, :, evnt] <= threshold) & (targets[:, :, evnt] <= threshold)).float().sum()
+            fp = ((predictions[:, :, evnt] > threshold) & (targets[:, :, evnt] <= threshold)).float().sum()
+            fn = ((predictions[:, :, evnt] <= threshold) & (targets[:, :, evnt] > threshold)).float().sum()
+
+            precision = tp / (tp + fp + 1e-6)
+            recall = tp / (tp + fn + 1e-6)
+            f1 = 2 * (precision * recall) / (precision + recall + 1e-6)
+            accuracy = (tp + tn) / (tp + tn + fp + fn)
+
+            result_tracker.add_metric(f'{prefix}PRE@{threshold}_{evnt}', precision,
+                                      f'Precision at threshold {threshold} for event {evnt}')
+            result_tracker.add_metric(f'{prefix}REC@{threshold}_{evnt}', recall,
+                                      f'Recall at threshold {threshold} for event {evnt}')
+            result_tracker.add_metric(f'{prefix}F1@{threshold}_{evnt}', f1,
+                                      f'F1 at threshold {threshold} for event {evnt}')
+            result_tracker.add_metric(f'{prefix}ACC@{threshold}_{evnt}', accuracy,
+                                      f'Accuracy at threshold {threshold} for event {evnt}')
+
+
+def prepare_on(_input_imgs, _input_scalars, _actions, _target, device):
     # we only use the first image
     _input_imgs = _input_imgs[0]
 
     # move everything to device
+    _actions = _actions.to(device)
     _input_scalars = _input_scalars.to(device)
     _target = _target.to(device)
     _input_imgs = _input_imgs.to(device)
-    return _input_imgs, _input_scalars, _target
+    return _input_imgs, _input_scalars, _actions, _target
 
 
 def main():
     # TODO: set limit to -1 to process all data
     # force data extraction and limit the number of samples
     force_data_extraction = False
-    limit = -1
+    limit = 5
 
     # check if pre-processed data exists in tmp folder
     # or flag to force re-processing
@@ -387,36 +477,60 @@ def main():
     data_set = pickle.load(open(DATA_PICKLE_FILE, 'rb'))
     assert data_set is not None, "Data set is None"
 
-    print(f"Data set loaded: {len(data_set)} samples")
-    train_set, test_set = train_test_split(data_set, test_size=0.2)
+    ##############################################################
+    # train the model using the data set
+    ##############################################################
 
-    # unzip the train_set and convert it to a tensor dataset
-    dataset_train = DatasetWithMeta(train_set)
-    dataset_loader_train = torch.utils.data.DataLoader(
-        dataset_train, batch_size=32, shuffle=True, num_workers=8, pin_memory=True
-    )
+    # we train the model 5 times to get a better average of the results
+    result_tracker = ResultTracker()
+    REPEATS = 1
+    for i in range(REPEATS):
+        print(f"Data set loaded: {len(data_set)} samples")
+        train_set, test_set = train_test_split(data_set, test_size=0.2, shuffle=True)
 
-    dataset_test = DatasetWithMeta(test_set)
-    dataset_loader_test = torch.utils.data.DataLoader(dataset_test, batch_size=32, shuffle=False)
+        # unzip the train_set and convert it to a tensor dataset
+        dataset_train = DatasetWithMeta(train_set)
+        dataset_loader_train = torch.utils.data.DataLoader(
+            dataset_train, batch_size=32, shuffle=True, num_workers=8, pin_memory=True
+        )
 
+        dataset_test = DatasetWithMeta(test_set)
+        dataset_loader_test = torch.utils.data.DataLoader(dataset_test, batch_size=32, shuffle=False)
+
+        report_imbalance(dataset_test, dataset_train)
+
+        train_model(dataset_loader_train, dataset_loader_test, result_tracker)
+
+        ##############################################################
+        # print the summary
+        ##############################################################
+        print("""
+
+##############################################################
+# print the summary
+##############################################################
+
+
+    """)
+    result_tracker.print_summary()
+
+
+def report_imbalance(dataset_test, dataset_train):
     # calc dataset imbalance for each target
     print("\n")
     print("Dataset imbalance [train]:")
     targets = dataset_train.targets
     target_names = ['unable_to_follow_commands', 'has_misplaced_feets', 'has_stumbling']
     for i in range(targets.shape[1]):
-        print(f" » {target_names[i]} (target  {i}): {targets[:, i].sum() / len(targets) * 100:.2f}%")
-    print("\n")
+        print(f" » {target_names[i]} (target  {i}): {targets[:, :, i].sum() / (len(targets) * LOOKBACK) * 100:.2f}%")
 
     # calc dataset imbalance for each target
     print("\n")
     print("Dataset imbalance [test]:")
     targets = dataset_test.targets
     for i in range(targets.shape[1]):
-        print(f" » {target_names[i]} (target  {i}): {targets[:, i].sum() / len(targets) * 100:.2f}%")
+        print(f" » {target_names[i]} (target  {i}): {targets[:, :, i].sum() / (len(targets) * LOOKBACK) * 100:.2f}%")
     print("\n")
-
-    train_model(dataset_loader_train, dataset_loader_test)
 
 
 def extract_data_from_bags(limit=-1):
