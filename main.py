@@ -309,6 +309,10 @@ def train_model(train_loader: DataLoader[DatasetWithMeta], test_loader: DataLoad
     count = 0
     model.eval()
 
+    accuracy_05_target_0 = 0
+    accuracy_05_target_1 = 0
+    accuracy_05_target_2 = 0
+
     # save model parameters
     torch.save(model.state_dict(), 'model_params.pth')
 
@@ -339,11 +343,22 @@ def train_model(train_loader: DataLoader[DatasetWithMeta], test_loader: DataLoad
         accuracy_10 += torch.sum(torch.abs(res - _target) < 0.1).to('cpu').detach().numpy()
         accuracy_20 += torch.sum(torch.abs(res - _target) < 0.2).to('cpu').detach().numpy()
 
+        accuracy_05_target_0 += torch.sum(torch.abs(res[:, 0] - _target[:, 0]) < 0.05).to('cpu').detach().numpy()
+        accuracy_05_target_1 += torch.sum(torch.abs(res[:, 1] - _target[:, 1]) < 0.05).to('cpu').detach().numpy()
+        accuracy_05_target_2 += torch.sum(torch.abs(res[:, 2] - _target[:, 2]) < 0.05).to('cpu').detach().numpy()
+
     mean_mse /= test_loader.__len__()
     print(f"Mean MSE: {mean_mse}")
     print(f"Accuracy [0.05]: {accuracy_05 / (test_loader.__len__() * test_loader.batch_size * num_actions) * 100:.2f}%")
     print(f"Accuracy  [0.1]: {accuracy_10 / (test_loader.__len__() * test_loader.batch_size * num_actions) * 100:.2f}%")
     print(f"Accuracy  [0.2]: {accuracy_20 / (test_loader.__len__() * test_loader.batch_size * num_actions) * 100:.2f}%")
+
+    print(
+        f"Accuracy [0.05] target 0: {accuracy_05_target_0 / (test_loader.__len__() * test_loader.batch_size) * 100:.2f}%")
+    print(
+        f"Accuracy [0.05] target 1: {accuracy_05_target_1 / (test_loader.__len__() * test_loader.batch_size) * 100:.2f}%")
+    print(
+        f"Accuracy [0.05] target 2: {accuracy_05_target_2 / (test_loader.__len__() * test_loader.batch_size) * 100:.2f}%")
 
 
 def prepare_on(_input_imgs, _input_scalars, _target, device):
