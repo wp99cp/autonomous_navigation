@@ -18,7 +18,7 @@ from utils.data_handler import DataHandler, LOOKBACK
 from utils.dataset_with_meta import DatasetWithMeta
 from utils.utils import get_rgb_image
 
-DATA_PICKLE_FILE = '/tmp/data_FrRL.pkl'
+DATA_PICKLE_FILE = '/tmp/data_FrRL_bahnhofstrasse.pkl'
 CREATE_PLOTS = False
 
 
@@ -246,7 +246,7 @@ def _label_extraction(ys, xs):
         max_velocity_RH = np.max(np.abs(velocity_RH))
 
         # check if the mean velocity is above a threshold
-        velocity_threshold = 2e-5
+        velocity_threshold = 3.60e-3
         has_stumbling = (max_velocity_LF > velocity_threshold or
                          max_velocity_RF > velocity_threshold or
                          max_velocity_LH > velocity_threshold or
@@ -257,7 +257,7 @@ def _label_extraction(ys, xs):
         # is calculated based on the contact forces
         ##############################################################
 
-        contact_force_threshold = 197
+        contact_force_threshold = 340
         has_high_contact_force = (max(contact_force_LF_z) > contact_force_threshold or
                                   max(contact_force_RF_z) > contact_force_threshold or
                                   max(contact_force_LH_z) > contact_force_threshold or
@@ -270,7 +270,7 @@ def _label_extraction(ys, xs):
         ##############################################################
         command_twist_x = command.twist.linear.x
         mean_error_command_twist_x = np.mean(np.abs(np.array(twist_x) - command_twist_x))
-        is_unable_to_follow_commands = mean_error_command_twist_x >= 0.005
+        is_unable_to_follow_commands = mean_error_command_twist_x >= 0.03
 
         ##############################################################
         # report the results
@@ -538,7 +538,7 @@ def main():
     # TODO: set limit to -1 to process all data
     # force data extraction and limit the number of samples
     force_data_extraction = True
-    limit = 1
+    limit = -1
 
     # check if pre-processed data exists in tmp folder
     # or flag to force re-processing
@@ -610,8 +610,8 @@ def report_imbalance(dataset_test, dataset_train):
 
 
 def extract_data_from_bags(limit=-1):
-    bags_base_dir = 'data/mission_data/'
-    # bags_base_dir = 'data/20230818_Bahnhofstrasse_Dodo/mission_data/dodo_mission_2023_08_19/'
+    # bags_base_dir = 'data/RosBags/raw/'
+    bags_base_dir = 'data/20230818_Bahnhofstrasse_Dodo/mission_data/dodo_mission_2023_08_19/'
     # bags_base_dir = 'data/20230302_Hoengg_Forst_Dodo/mission_data/'
 
     # list all folders in the base directory
