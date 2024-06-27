@@ -7,6 +7,8 @@ from tqdm import tqdm
 
 from utils.sliding_window_queue import SlidingWindowQueue
 
+LOOKBACK = 3
+
 
 def _print_lock(func):
     def wrapper(*args, **kwargs):
@@ -201,7 +203,7 @@ class DataHandler:
         img_queue = SlidingWindowQueue(maxsize=2)
         pre_state_queue = SlidingWindowQueue(maxsize=5)
         post_state_queue = SlidingWindowQueue(maxsize=300)
-        training_queue = SlidingWindowQueue(maxsize=10)
+        training_queue = SlidingWindowQueue(maxsize=300)
 
         counter = 0
         fst_cmd_t = None
@@ -272,6 +274,8 @@ class DataHandler:
         print("========================\n")
         return self.training_data_arr
 
+    training_data_queue = SlidingWindowQueue(maxsize=300)
+
     def save_to_training_set(self, fst_cmd_t, post_state_queue, training_queue):
 
         training_data = training_queue.get()
@@ -301,7 +305,43 @@ class DataHandler:
         assert cmd_t >= fst_cmd_t, \
             f"Expected {cmd_t} <= {fst_cmd_t}"
 
-        self.training_data_arr.append((
-            training_data,
-            events
-        ))
+        command = training_data['command']
+        training_data['commands'] = [command]
+        del training_data['command']
+
+        ARTIFICAL_SPACING = 3
+        for i in range(LOOKBACK):
+            idx = -i * ARTIFICAL_SPACING - 1
+            if idx < -len(self.training_data_queue.queue):
+                break
+
+            self.training_data_queue.queue[idx][0]['commands'].append(command)
+
+        # if we have collected enough commands (A=LOOKBACK), we save the data
+        if bool(self.training_data_queue.queue) and len(self.training_data_queue.queue[0][0]['commands']) >= LOOKBACK:
+            training_data, events = self.training_data_queue.get()
+
+            training_data['commands'] = training_data['commands'][:LOOKBACK]
+
+            # print where the events are placed
+            command_0 = training_data['commands'][0].header.stamp
+            command_1 = training_data['commands'][1].header.stamp
+            command_2 = training_data['commands'][2].header.stamp
+
+            state_ts = list(map(lambda x: x.header.stamp, events))
+
+            states_before_0 = list(filter(lambda x: x < command_0, state_ts))
+            states_before_1 = list(filter(lambda x: x < command_1, state_ts))
+            states_before_2 = list(filter(lambda x: x < command_2, state_ts))
+
+            # print(f"Commands after {len(states_before_0)}, {len(states_before_1)}, {len(states_before_2)} states")
+
+            self.training_data_arr.append((
+                training_data,
+                events
+            ))
+
+        self.training_data_queue.put((
+                training_data,
+                events
+            ))

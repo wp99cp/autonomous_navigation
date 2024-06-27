@@ -1,26 +1,25 @@
 import multiprocessing
 import os
 import pickle
+from threading import Thread
+from typing import List
 
 import numpy as np
 import torch
 from matplotlib import pyplot as plt
 from sklearn.metrics import accuracy_score, precision_score, recall_score
-from sklearn.metrics import roc_auc_score
 from sklearn.metrics import roc_curve
 from sklearn.model_selection import train_test_split
 from torch.utils.data import TensorDataset, DataLoader
 from tqdm import tqdm
 
 from model import Model
-from utils.data_handler import DataHandler
+from utils.data_handler import DataHandler, LOOKBACK
 from utils.dataset_with_meta import DatasetWithMeta
 from utils.utils import get_rgb_image
 
 DATA_PICKLE_FILE = '/tmp/data_FrRL.pkl'
 CREATE_PLOTS = False
-
-LOOKBACK = 3
 
 
 class ResultTracker:
@@ -75,13 +74,9 @@ def _feature_extraction(xs, ys):
             numerical_features.append(state.joints.acceleration[i])
             numerical_features.append(state.joints.position[i])
 
-    command = xs['command']
-
-    com_x = command.twist.linear.x
-    com_z = command.twist.angular.z
-
-    # TODO: extract actions
-    actions = [[com_x, com_z] for _ in range(LOOKBACK)]
+    commands = xs['commands'][:LOOKBACK]
+    assert len(commands) == LOOKBACK, f"Expected {LOOKBACK} commands, got {len(commands)}"
+    actions = [[command.twist.linear.x, command.twist.angular.z] for command in commands]
 
     # get images and convert them to RGB
     imgs = []
@@ -109,12 +104,8 @@ def _label_extraction(ys, xs):
     twist_y = [y.twist.twist.linear.y for y in ys]
     twist_z = [y.twist.twist.linear.z for y in ys]
 
-    command = xs['command']
-
-    ##############################################################
-    ##############################################################
-    ##############################################################
-    ##############################################################
+    commands = xs['commands'][:LOOKBACK]
+    assert len(commands) == LOOKBACK, f"Expected {LOOKBACK} commands, got {len(commands)}"
 
     # map index to time stamps
     idxs = [y.header.stamp.to_sec() for y in ys]
@@ -146,7 +137,7 @@ def _label_extraction(ys, xs):
                     p.axvline(x=cmd_timestamp, color='b', linestyle='-.', alpha=0.1)
 
             # plot horizontal line at command.twist.linear.x
-            p.axvline(x=command.header.stamp.to_sec(), color='b', linestyle='--', alpha=0.5)
+            p.axvline(x=commands[0].header.stamp.to_sec(), color='b', linestyle='--', alpha=0.5)
 
         plt1.plot(idxs, contact_force_LF_z, label='LF')
         plt1.plot(idxs, contact_force_RF_z, label='RF')
@@ -177,13 +168,13 @@ def _label_extraction(ys, xs):
         plt3.set_title(f'RGB Image [Captured at {time_stamp}]')
 
         # add description
-        plt3.text(7, 190, f'cmd.linear.x={command.twist.linear.x:.2f} m/s', color='white', fontsize=10,
+        plt3.text(7, 190, f'cmd.linear.x={commands[0].twist.linear.x:.2f} m/s', color='white', fontsize=10,
                   fontweight='bold')
-        plt3.text(7, 200, f'cmd.angular.z={command.twist.angular.z:.2f} rad/s', color='white', fontsize=10,
+        plt3.text(7, 200, f'cmd.angular.z={commands[0].twist.angular.z:.2f} rad/s', color='white', fontsize=10,
                   fontweight='bold')
 
         # plot horizontal line at command.twist.linear.x
-        plt4.axhline(y=command.twist.linear.x, color='b', linestyle='--', label='cmd.linear.x', alpha=0.5)
+        plt4.axhline(y=commands[0].twist.linear.x, color='b', linestyle='--', label='cmd.linear.x', alpha=0.5)
 
         plt4.plot(idxs, twist_x, label='x')
         plt4.plot(idxs, twist_y, label='y')
@@ -208,62 +199,85 @@ def _label_extraction(ys, xs):
         # close the plot
         plt.close(fig)
 
-    ##############################################################
-    ##############################################################
-    ##############################################################
-    ##############################################################
+    labels_per_action = []
+    last_max_idx = 0
+    for i, command in enumerate(commands):
+        next_command = commands[i + 1] if i + 1 < len(commands) else None
+        max_idx = len(ys) if next_command is None else len(
+            list(filter(lambda x: x.header.stamp.to_sec() < next_command.header.stamp.to_sec(), ys)))
 
-    ##############################################################
-    # stumbling / slippering
-    # is calculated based on the feet velocities
-    ##############################################################
+        assert max_idx > last_max_idx, f"Expected max_idx > last_max_idx, got {max_idx} <= {last_max_idx}"
+        ys_limited = ys[last_max_idx:max_idx]
+        last_max_idx = max_idx
 
-    # calculate the velocity of the feet
-    velocity_LF = np.diff(position_LF_z, n=1)
-    velocity_RF = np.diff(position_RF_z, n=1)
-    velocity_LH = np.diff(position_LH_z, n=1)
-    velocity_RH = np.diff(position_RH_z, n=1)
+        contact_force_LF_z = [y.contacts[0].wrench.force.z for y in ys_limited]
+        contact_force_RF_z = [y.contacts[1].wrench.force.z for y in ys_limited]
+        contact_force_LH_z = [y.contacts[2].wrench.force.z for y in ys_limited]
+        contact_force_RH_z = [y.contacts[3].wrench.force.z for y in ys_limited]
 
-    # calculate the mean velocity
-    max_velocity_LF = np.max(np.abs(velocity_LF))
-    max_velocity_RF = np.max(np.abs(velocity_RF))
-    max_velocity_LH = np.max(np.abs(velocity_LH))
-    max_velocity_RH = np.max(np.abs(velocity_RH))
+        position_LF_z = [y.contacts[0].position.z for y in ys_limited]
+        position_RF_z = [y.contacts[1].position.z for y in ys_limited]
+        position_LH_z = [y.contacts[2].position.z for y in ys_limited]
+        position_RH_z = [y.contacts[3].position.z for y in ys_limited]
 
-    # check if the mean velocity is above a threshold
-    velocity_threshold = 11e-3
-    has_stumbling = (max_velocity_LF > velocity_threshold or
-                     max_velocity_RF > velocity_threshold or
-                     max_velocity_LH > velocity_threshold or
-                     max_velocity_RH > velocity_threshold)
+        twist_x = [y.twist.twist.linear.x for y in ys_limited]
+        twist_y = [y.twist.twist.linear.y for y in ys_limited]
+        twist_z = [y.twist.twist.linear.z for y in ys_limited]
 
-    ##############################################################
-    # misplaced feets
-    # is calculated based on the contact forces
-    ##############################################################
+        ##############################################################
+        # stumbling / slippering
+        # is calculated based on the feet velocities
+        ##############################################################
 
-    contact_force_threshold = 600
-    has_high_contact_force = (max(contact_force_LF_z) > contact_force_threshold or
-                              max(contact_force_RF_z) > contact_force_threshold or
-                              max(contact_force_LH_z) > contact_force_threshold or
-                              max(contact_force_RH_z) > contact_force_threshold)
-    has_misplaced_feets = has_high_contact_force
+        # this code snipped was used to test the stumbling detection
+        # based on the velocity of the feet (z-axis); this differs
+        # from the final implementation as described in the report
 
-    ##############################################################
-    # unable to follow commands
-    # is calculated by the difference between the command and the actual twist.linear.x
-    ##############################################################
-    command_twist_x = command.twist.linear.x
-    mean_error_command_twist_x = np.mean(np.abs(np.array(twist_x) - command_twist_x))
-    is_unable_to_follow_commands = mean_error_command_twist_x >= 0.18
+        # calculate the velocity of the feet
+        velocity_LF = np.diff(position_LF_z, n=1)
+        velocity_RF = np.diff(position_RF_z, n=1)
+        velocity_LH = np.diff(position_LH_z, n=1)
+        velocity_RH = np.diff(position_RH_z, n=1)
 
-    ##############################################################
-    # report the results
-    ##############################################################
+        # calculate the mean velocity
+        max_velocity_LF = np.max(np.abs(velocity_LF))
+        max_velocity_RF = np.max(np.abs(velocity_RF))
+        max_velocity_LH = np.max(np.abs(velocity_LH))
+        max_velocity_RH = np.max(np.abs(velocity_RH))
 
-    # TODO: split the labels...
-    labels = [is_unable_to_follow_commands, has_misplaced_feets, has_stumbling]
-    return [labels, labels, labels]
+        # check if the mean velocity is above a threshold
+        velocity_threshold = 2e-5
+        has_stumbling = (max_velocity_LF > velocity_threshold or
+                         max_velocity_RF > velocity_threshold or
+                         max_velocity_LH > velocity_threshold or
+                         max_velocity_RH > velocity_threshold)
+
+        ##############################################################
+        # misplaced feets
+        # is calculated based on the contact forces
+        ##############################################################
+
+        contact_force_threshold = 197
+        has_high_contact_force = (max(contact_force_LF_z) > contact_force_threshold or
+                                  max(contact_force_RF_z) > contact_force_threshold or
+                                  max(contact_force_LH_z) > contact_force_threshold or
+                                  max(contact_force_RH_z) > contact_force_threshold)
+        has_misplaced_feets = has_high_contact_force
+
+        ##############################################################
+        # unable to follow commands
+        # is calculated by the difference between the command and the actual twist.linear.x
+        ##############################################################
+        command_twist_x = command.twist.linear.x
+        mean_error_command_twist_x = np.mean(np.abs(np.array(twist_x) - command_twist_x))
+        is_unable_to_follow_commands = mean_error_command_twist_x >= 0.005
+
+        ##############################################################
+        # report the results
+        ##############################################################
+        labels_per_action.append([is_unable_to_follow_commands, has_misplaced_feets, has_stumbling])
+
+    return labels_per_action
 
 
 def _prepare_data(item):
@@ -295,7 +309,7 @@ def train_model(
     del first_element
 
     # train the model
-    epochs = 15
+    epochs = 20
 
     # calc training imbalance
     compensate_imbalance = True
@@ -315,7 +329,7 @@ def train_model(
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.00001, amsgrad=True, betas=(0.9, 0.999), eps=1e-6)
     loss_fn = torch.nn.BCEWithLogitsLoss(pos_weight=class_weights)
-    lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.25)
+    lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=4, gamma=0.5)
 
     model.train()
 
@@ -477,9 +491,9 @@ def calc_matrices(predictions, result_tracker, targets, prefix=''):
                                       f'Accuracy at threshold {threshold} for event {evnt}')
 
     # calc roc auc
-    for evnt in range(predictions.shape[2]):
-        roc_auc = roc_auc_score(targets[:, :, evnt], predictions[:, :, evnt])
-        result_tracker.add_metric(f'{prefix}ROC_AUC_{evnt}', roc_auc, f'ROC AUC for event {evnt}')
+    # for evnt in range(predictions.shape[2]):
+    #    roc_auc = roc_auc_score(targets[:, :, evnt], predictions[:, :, evnt])
+    #    result_tracker.add_metric(f'{prefix}ROC_AUC_{evnt}', roc_auc, f'ROC AUC for event {evnt}')
 
     # plot the roc curve
     fpr, tpr, thresholds = roc_curve(targets.flatten(), predictions.flatten())
@@ -492,7 +506,16 @@ def calc_matrices(predictions, result_tracker, targets, prefix=''):
     plt.title(f'{prefix}ROC curve')
     plt.xlabel('False Positive Rate')
     plt.ylabel('True Positive Rate')
-    plt.savefig(f'/tmp/{prefix}roc_curve.png')
+    plt.legend()
+
+    plt.yscale('linear')
+    plt.xscale('linear')
+    plt.savefig(f'{prefix}roc_curve.png')
+
+    plt.xscale('log')
+    plt.yscale('log')
+    plt.savefig(f'{prefix}roc_curve_log_scale.png')
+
     # plt.clf()
 
 
@@ -514,8 +537,8 @@ def prepare_on(_input_imgs, _input_scalars, _actions, _target, device):
 def main():
     # TODO: set limit to -1 to process all data
     # force data extraction and limit the number of samples
-    force_data_extraction = False
-    limit = -1
+    force_data_extraction = True
+    limit = 1
 
     # check if pre-processed data exists in tmp folder
     # or flag to force re-processing
@@ -526,13 +549,15 @@ def main():
     data_set = pickle.load(open(DATA_PICKLE_FILE, 'rb'))
     assert data_set is not None, "Data set is None"
 
+    print(f"Data set loaded: {len(data_set)} samples")
+
     ##############################################################
     # train the model using the data set
     ##############################################################
 
     # we train the model 5 times to get a better average of the results
     result_tracker = ResultTracker()
-    REPEATS = 4
+    REPEATS = 10
     for i in range(REPEATS):
         plt.clf()
 
@@ -542,7 +567,7 @@ def main():
         # unzip the train_set and convert it to a tensor dataset
         dataset_train = DatasetWithMeta(train_set)
         dataset_loader_train = torch.utils.data.DataLoader(
-            dataset_train, batch_size=128, shuffle=True, num_workers=8, pin_memory=True
+            dataset_train, batch_size=96, shuffle=True, num_workers=8, pin_memory=True
         )
 
         dataset_test = DatasetWithMeta(test_set)
@@ -585,7 +610,9 @@ def report_imbalance(dataset_test, dataset_train):
 
 
 def extract_data_from_bags(limit=-1):
-    bags_base_dir = 'data/RosBags/raw/'
+    bags_base_dir = 'data/mission_data/'
+    # bags_base_dir = 'data/20230818_Bahnhofstrasse_Dodo/mission_data/dodo_mission_2023_08_19/'
+    # bags_base_dir = 'data/20230302_Hoengg_Forst_Dodo/mission_data/'
 
     # list all folders in the base directory
     dirs = os.listdir(bags_base_dir)
@@ -657,6 +684,7 @@ def extract_data_from_bags(limit=-1):
 
             except Exception as e:
                 print(f"Error processing bags: {e}")
+                print(e)
 
     # total number of samples
     print(f"\nTotal number of samples: {len(dataset)}")
@@ -670,6 +698,10 @@ def extract_data_from_bags(limit=-1):
 
     pickle.dump(dataset, open(DATA_PICKLE_FILE, 'wb'))
     print("\nData saved to", DATA_PICKLE_FILE)
+
+
+
+
 
 
 if __name__ == "__main__":
