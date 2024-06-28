@@ -18,7 +18,7 @@ from utils.data_handler import DataHandler, LOOKBACK
 from utils.dataset_with_meta import DatasetWithMeta
 from utils.utils import get_rgb_image
 
-DATA_PICKLE_FILE = '/tmp/data_FrRL_bahnhofstrasse.pkl'
+DATA_PICKLE_FILE = '/tmp/data_FrRL_Forest.pkl'
 CREATE_PLOTS = False
 
 
@@ -257,7 +257,7 @@ def _label_extraction(ys, xs):
         # is calculated based on the contact forces
         ##############################################################
 
-        contact_force_threshold = 340
+        contact_force_threshold = 280
         has_high_contact_force = (max(contact_force_LF_z) > contact_force_threshold or
                                   max(contact_force_RF_z) > contact_force_threshold or
                                   max(contact_force_LH_z) > contact_force_threshold or
@@ -270,7 +270,7 @@ def _label_extraction(ys, xs):
         ##############################################################
         command_twist_x = command.twist.linear.x
         mean_error_command_twist_x = np.mean(np.abs(np.array(twist_x) - command_twist_x))
-        is_unable_to_follow_commands = mean_error_command_twist_x >= 0.03
+        is_unable_to_follow_commands = mean_error_command_twist_x >= 0.08
 
         ##############################################################
         # report the results
@@ -537,7 +537,7 @@ def prepare_on(_input_imgs, _input_scalars, _actions, _target, device):
 def main():
     # TODO: set limit to -1 to process all data
     # force data extraction and limit the number of samples
-    force_data_extraction = True
+    force_data_extraction = False
     limit = -1
 
     # check if pre-processed data exists in tmp folder
@@ -588,7 +588,7 @@ def main():
 
 
     """)
-    result_tracker.print_summary()
+        result_tracker.print_summary()
 
 
 def report_imbalance(dataset_test, dataset_train):
@@ -611,8 +611,8 @@ def report_imbalance(dataset_test, dataset_train):
 
 def extract_data_from_bags(limit=-1):
     # bags_base_dir = 'data/RosBags/raw/'
-    bags_base_dir = 'data/20230818_Bahnhofstrasse_Dodo/mission_data/dodo_mission_2023_08_19/'
-    # bags_base_dir = 'data/20230302_Hoengg_Forst_Dodo/mission_data/'
+    # bags_base_dir = 'data/20230818_Bahnhofstrasse_Dodo/mission_data/dodo_mission_2023_08_19/'
+    bags_base_dir = 'data/20230302_Hoengg_Forst_Dodo/mission_data/'
 
     # list all folders in the base directory
     dirs = os.listdir(bags_base_dir)

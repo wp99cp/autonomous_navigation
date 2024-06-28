@@ -191,7 +191,7 @@ class DataHandler:
 
         # get msg streams
         img_stream, img_stream_start_t, _ = self.get_msg_stream(
-            '/wide_angle_camera_rear/image_color_rect/compressed')
+            '/wide_angle_camera_front/image_color/compressed')
         state_stream, state_stream_start_t, _ = self.get_msg_stream(
             '/state_estimator/anymal_state')
         command_stream, command_stream_start_t, _ = self.get_msg_stream(
@@ -342,6 +342,6 @@ class DataHandler:
             ))
 
         self.training_data_queue.put((
-                training_data,
-                events
-            ))
+            training_data,
+            events
+        ))
