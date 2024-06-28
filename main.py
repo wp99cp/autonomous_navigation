@@ -10,6 +10,7 @@ from matplotlib import pyplot as plt
 from sklearn.metrics import accuracy_score, precision_score, recall_score
 from sklearn.metrics import roc_curve
 from sklearn.model_selection import train_test_split
+from torch.nn import BCELoss
 from torch.utils.data import TensorDataset, DataLoader
 from tqdm import tqdm
 
@@ -18,7 +19,7 @@ from utils.data_handler import DataHandler, LOOKBACK
 from utils.dataset_with_meta import DatasetWithMeta
 from utils.utils import get_rgb_image
 
-DATA_PICKLE_FILE = '/tmp/data_FrRL_Forest.pkl'
+DATA_PICKLE_FILE = '/tmp/data_FrRL_bahnhofstrasse.pkl'
 CREATE_PLOTS = False
 
 
